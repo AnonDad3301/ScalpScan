@@ -61,6 +61,10 @@ class TradesStore:
         )
         self.conn.commit()
 
+    def append_closed(self, t: Dict[str, Any]) -> None:
+        """Alias for upsert to maintain compatibility"""
+        self.upsert(t)
+
     def tail(self, limit: int = 200) -> List[Dict[str, Any]]:
         cur = self.conn.execute("SELECT payload_json FROM trades ORDER BY exit_ts DESC LIMIT ?", (int(limit),))
         out=[]

@@ -133,10 +133,14 @@ async def handler(ws):
         clients.discard(ws)
 
 
+# Global variable to store trades_store reference
+trades_store_global = None
+
 def append_event(es, rt: Dict[str, Any], stage: str, payload: Dict[str, Any], run_id: str="sys", level: str="INFO", symbol: str="*"):
     if stage == "TRADE_CLOSED":
         try:
-            trades_store.upsert(payload)
+            if trades_store_global is not None:
+                trades_store_global.upsert(payload)
         except Exception:
             pass
     es.append({
@@ -445,6 +449,8 @@ async def main():
     rt = cfg["runtime"]
     es = SQLiteEventStore(cfg["storage"]["events_db"])
     trades_store = TradesStore(cfg["storage"].get("trades_db","data/trades.sqlite"))
+    global trades_store_global
+    trades_store_global = trades_store
     ss = FileSnapshotStore(cfg["storage"]["snapshots_dir"])
     symdb = SymbolStore(cfg["storage"]["symbols_db"])
 
