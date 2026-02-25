@@ -218,6 +218,16 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
         while True:
             t0 = time.time()
             syms = list(getattr(eng.portfolio, "positions", {}).keys())
+            ws_connected=False; ws_stale_ms=None; ws_ticker_1s=None; ws_sub_ok=None; ws_sub_err=None
+            try:
+                _, st = await ws_client.get_prices()
+                ws_connected = bool(st.connected)
+                ws_ticker_1s = int(st.ticker_updates_1s)
+                ws_sub_ok = int(st.sub_ok)
+                ws_sub_err = int(st.sub_err)
+                ws_stale_ms = int(time.time()*1000) - int(st.last_msg_ms)
+            except Exception:
+                pass
             try:
                 await ws_client.set_desired(syms)
             except Exception:
@@ -242,6 +252,7 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
             except Exception:
                 pass
             prices: Dict[str, float] = {}
+            pm: Dict[str, Any] = {"status": "SKIP", "reason": "no_symbols"}
             status = "OK"
             try:
                 if syms:
@@ -279,10 +290,9 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
                             'stale': stale,
                             'missing_n': len(missing),
                         }, run_id='price')
-                    prices, pm = price_worker.fetch_prices(syms, timeout_sec=price_timeout)
                 if not isinstance(prices, dict):
                     prices = {}
-                if pm.get("status") != "OK":
+                if syms and pm.get("status") != "OK":
                     append_event(es, rt, "PRICE_WORKER", pm, run_id="price", level="ERROR")
 
 
@@ -345,17 +355,6 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
 
             dt_ms = int((time.time()-t0)*1000)
             liveness["price"] = time.monotonic()
-            # WS diagnostics
-            ws_connected=False; ws_stale_ms=None; ws_ticker_1s=None; ws_sub_ok=None; ws_sub_err=None
-            try:
-                _, st = await ws_client.get_prices()
-                ws_connected = bool(st.connected)
-                ws_ticker_1s = int(st.ticker_updates_1s)
-                ws_sub_ok = int(st.sub_ok)
-                ws_sub_err = int(st.sub_err)
-                ws_stale_ms = int(time.time()*1000) - int(st.last_msg_ms)
-            except Exception:
-                pass
             append_event(es, rt, "PRICE_TICK", {"open_positions": len(syms), "prices_n": len(prices), "dt_ms": dt_ms, "status": status, "symbols": syms[:50], "ws_connected": ws_connected, "ws_stale_ms": ws_stale_ms, "ws_ticker_1s": ws_ticker_1s, "ws_sub_ok": ws_sub_ok, "ws_sub_err": ws_sub_err}, run_id="price")
 
             try:
