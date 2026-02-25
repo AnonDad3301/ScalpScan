@@ -17,6 +17,7 @@ from packages.model.model_b_trainer import Trainer
 from packages.decision.gate import decide as gate_decide
 from packages.execution.paper import PaperPortfolio
 from packages.obs.telemetry import Telemetry
+from packages.modernization import MarketPatternScanner, MultiHorizonForecaster, MarketRegimeDetector
 
 
 def now_ms() -> int:
@@ -68,6 +69,19 @@ class Engine:
         self.trainer=OnlineTrainer(k=int(mc.get('k',35)), min_samples=int(mc.get('min_samples',300)), retrain_interval_sec=float(mc.get('retrain_interval_sec',60.0)), max_train_samples=int(mc.get('max_train_samples',3000)), max_val_samples=int(mc.get('max_val_samples',200)))
         self.portfolio=PaperPortfolio(cfg)
         self.telemetry = Telemetry(path=str(cfg.get('storage',{}).get('data_dir','data')) + '/telemetry_engine.jsonl', service='engine', es=es, base_event={'exchange':cfg['runtime']['exchange'],'market':cfg['runtime']['market'],'timeframe':cfg['runtime']['timeframe']})
+        mod_cfg = cfg.get('modernization', {})
+        self.pattern_scanner = MarketPatternScanner(
+            bins=int(mod_cfg.get('volume_profile_bins', 24)),
+            breakout_window=int(mod_cfg.get('breakout_window', 20)),
+        )
+        self.forecaster = MultiHorizonForecaster(
+            horizons=mod_cfg.get('forecast_horizons', [1, 3, 5, 15]),
+            mc_samples=int(mod_cfg.get('forecast_mc_samples', 64)),
+        )
+        self.regime_detector = MarketRegimeDetector(
+            vol_threshold=float(mod_cfg.get('regime_volatility_threshold', 0.004)),
+            trend_threshold=float(mod_cfg.get('regime_trend_threshold', 0.25)),
+        )
 
 
     def sync_symbols(self) -> int:
@@ -129,6 +143,12 @@ class Engine:
                     continue
 
                 arr=np.array([c for _,_,_,_,c,_ in ohlcv], dtype=float)
+                pattern = self.pattern_scanner.scan(ohlcv)
+                regime = self.regime_detector.detect(arr)
+                forecast = self.forecaster.predict(arr)
+                self.es.append(mk_event(env, "MARKET_PATTERN_SCAN", "INFO", pattern.as_dict()))
+                self.es.append(mk_event(env, "REGIME_DETECTED", "INFO", regime.as_dict()))
+                self.es.append(mk_event(env, "MULTI_HORIZON_FORECAST", "INFO", {"forecast": forecast}))
                 fwd=int(self.cfg["model"].get("forward",4))
                 y=label_forward(arr, fwd)
                 X=np.array([[feats["rsi"],feats["atr"],feats["adx"],feats["ob_imb"],feats["spread"]] for _ in range(len(arr))], dtype=float)

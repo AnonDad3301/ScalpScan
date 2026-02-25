@@ -23,6 +23,7 @@ from packages.infra.market.ccxt_market import CCXTMarket
 from apps.runtime.engine import Engine
 from backend.bybit_ws_prices import BybitPublicWS
 from backend.price_worker import PriceWorker
+from backend.monitoring_api import start_monitoring_api
 from packages.obs.telemetry import Telemetry
 
 
@@ -480,6 +481,14 @@ async def main():
 
     host = rt.get("ws_host", "127.0.0.1")
     port = int(rt.get("ws_port", 8765))
+    mon_host = rt.get("monitoring_host", "127.0.0.1")
+    mon_port = int(rt.get("monitoring_port", 8081))
+    mon_server = await start_monitoring_api(mon_host, mon_port, STATE)
+    if mon_server is not None:
+        append_event(es, rt, "MONITORING_API_READY", {"host": mon_host, "port": mon_port}, run_id="sys", level="INFO")
+    else:
+        append_event(es, rt, "MONITORING_API_DISABLED", {"reason": "aiohttp_missing"}, run_id="sys", level="INFO")
+
     asyncio.create_task(COMMANDS.pump(eng, cfg, market, symdb))
 
     async with legacy_serve(handler, host, port, ping_interval=None, ping_timeout=None, logger=None):
