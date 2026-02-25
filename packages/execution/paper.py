@@ -1,0 +1,189 @@
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+@dataclass
+class Account:
+    deposit: float
+    cash: float
+    equity: float
+
+@dataclass
+class Position:
+    symbol: str
+    side: str
+    entry: float
+    qty: float
+    sl: float
+    tp1: float
+    tp2: float
+    open_ts: int
+    tp1_done: bool = False
+    be_done: bool = False
+    last_price: float = 0.0
+    realized: float = 0.0
+
+class PaperPortfolio:
+    """
+    Paper portfolio with real-time lifecycle:
+      - SL close
+      - TP1 partial
+      - BE move
+      - TP2 close
+      - time-stop close
+
+    Emits closed trades with final pnl (realized).
+    """
+    def __init__(self, cfg: Dict[str, Any]):
+        ex = cfg.get("execution", {})
+        self.fees_bps = float(ex.get("fees_bps", 2.0))
+        self.slip_bps = float(ex.get("slippage_bps", 1.0))
+        self.risk_usd = float(ex.get("risk_usd", 50.0))
+        self.max_positions = int(ex.get("max_positions", 20))
+        dep = float(ex.get("deposit_usd", 2000.0))
+        self.account = Account(dep, dep, dep)
+        self.positions: Dict[str, Position] = {}
+        self.exits = ex.get("exits", {})
+
+        self.per_trade_alloc_pct = float(ex.get("per_trade_alloc_pct", 0.10))
+        self.total_alloc_pct = float(ex.get("total_alloc_pct", 0.30))
+
+    def _cost_mult(self) -> float:
+        return (self.fees_bps + self.slip_bps) / 10000.0
+
+    def _open_cost_mult(self) -> float:
+        return 1.0 + self._cost_mult()
+
+    def _levels(self, price: float, side: str, atr: float):
+        base = max(price * 0.0012, atr)
+        sl_dist  = float(self.exits.get("sl_atr_mult", 1.2)) * base
+        tp1_dist = float(self.exits.get("tp1_atr_mult", 1.1)) * base
+        tp2_dist = float(self.exits.get("tp2_atr_mult", 1.7)) * base
+        if side == "LONG":
+            return price - sl_dist, price + tp1_dist, price + tp2_dist
+        else:
+            return price + sl_dist, price - tp1_dist, price - tp2_dist
+
+    def exposure_notional(self) -> float:
+        return sum(abs(p.entry * p.qty) for p in self.positions.values())
+
+    def can_open(self, notional: float) -> Optional[str]:
+        if len(self.positions) >= self.max_positions:
+            return "max_positions"
+        if notional * self._open_cost_mult() > self.account.cash:
+            return "insufficient_cash"
+        if notional > self.account.cash * self.per_trade_alloc_pct:
+            return "per_trade_alloc_cap"
+        if (self.exposure_notional() + notional) > (self.account.deposit * self.total_alloc_pct):
+            return "total_alloc_cap"
+        return None
+
+    def open(self, ts: int, symbol: str, side: str, price: float, atr: float) -> Dict[str, Any]:
+        if symbol in self.positions:
+            return {"result":"FAIL","reason":"already_open"}
+        sl, tp1, tp2 = self._levels(price, side, atr)
+
+        sl_dist = abs(price - sl) + 1e-12
+        qty_risk = self.risk_usd / sl_dist
+
+        notional_cap_trade = self.account.cash * self.per_trade_alloc_pct
+        qty_cap_trade = notional_cap_trade / (price + 1e-12)
+
+        notional_cap_total = (self.account.deposit * self.total_alloc_pct) - self.exposure_notional()
+        if notional_cap_total <= 0.0:
+            return {"result":"FAIL","reason":"total_alloc_cap"}
+        notional_cap_total = max(0.0, notional_cap_total)
+        qty_cap_total = notional_cap_total / (price + 1e-12)
+
+        qty_cap_cash = self.account.cash / (price * self._open_cost_mult() + 1e-12)
+
+        qty = max(0.0, min(qty_risk, qty_cap_trade, qty_cap_total, qty_cap_cash))
+        notional = qty * price
+        if qty <= 0.0:
+            return {"result":"FAIL","reason":"qty_zero_or_caps"}
+
+        reason = self.can_open(notional)
+        if reason:
+            return {"result":"FAIL","reason":reason}
+
+        self.account.cash -= notional * self._open_cost_mult()
+        self.positions[symbol] = Position(symbol, side, price, qty, sl, tp1, tp2, ts, last_price=price)
+        return {"result":"OK","qty":qty,"notional":notional,"sl":sl,"tp1":tp1,"tp2":tp2,"cash_after":self.account.cash}
+
+    def _unrealized(self, pos: Position, price: float) -> float:
+        return (price - pos.entry) * pos.qty if pos.side == "LONG" else (pos.entry - price) * pos.qty
+
+    def update_equity(self, prices: Dict[str, float]) -> None:
+        unreal = 0.0
+        for sym, pos in self.positions.items():
+            px = float(prices.get(sym, pos.last_price or pos.entry))
+            pos.last_price = px
+            unreal += self._unrealized(pos, px)
+        self.account.equity = self.account.cash + unreal
+
+    def manage_positions(self, ts: int, prices: Dict[str, float]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        updates: List[Dict[str, Any]] = []
+        closed: List[Dict[str, Any]] = []
+
+        tp1_frac = float(self.exits.get("tp1_fraction", 0.5))
+        be_r = float(self.exits.get("breakeven_r", 0.8))
+        time_stop_min = int(self.exits.get("time_stop_minutes", 35))
+
+        for sym, pos in list(self.positions.items()):
+            px = float(prices.get(sym, pos.last_price or pos.entry))
+            pos.last_price = px
+
+            if time_stop_min > 0 and (ts - pos.open_ts) >= time_stop_min * 60_000:
+                closed.append(self._close(sym, pos, px, ts, "TIME_STOP"))
+                continue
+
+            sl_hit = (px <= pos.sl) if pos.side == "LONG" else (px >= pos.sl)
+            if sl_hit:
+                closed.append(self._close(sym, pos, px, ts, "SL"))
+                continue
+
+            tp1_hit = (px >= pos.tp1) if pos.side == "LONG" else (px <= pos.tp1)
+            if (not pos.tp1_done) and tp1_hit and tp1_frac > 0:
+                qty_close = pos.qty * min(1.0, tp1_frac)
+                realized = self._realize_partial(pos, px, qty_close)
+                pos.tp1_done = True
+                updates.append({"symbol": sym, "event":"TP1", "price": px, "qty_closed": qty_close, "realized": realized})
+
+            if (not pos.be_done) and be_r > 0:
+                risk = abs(pos.entry - pos.sl) + 1e-12
+                move = (px - pos.entry) if pos.side == "LONG" else (pos.entry - px)
+                if move >= be_r * risk:
+                    pos.sl = pos.entry
+                    pos.be_done = True
+                    updates.append({"symbol": sym, "event":"BE", "sl": pos.sl})
+
+            tp2_hit = (px >= pos.tp2) if pos.side == "LONG" else (px <= pos.tp2)
+            if tp2_hit:
+                closed.append(self._close(sym, pos, px, ts, "TP2"))
+                continue
+
+        self.update_equity(prices)
+        return updates, closed
+
+    def _realize_partial(self, pos: Position, price: float, qty_close: float) -> float:
+        qty_close = max(0.0, min(qty_close, pos.qty))
+        if qty_close <= 0:
+            return 0.0
+        pnl = (price - pos.entry) * qty_close if pos.side == "LONG" else (pos.entry - price) * qty_close
+        cost = abs(price * qty_close) * self._cost_mult()
+        pnl -= cost
+        pos.qty -= qty_close
+        pos.realized += pnl
+        self.account.cash += abs(price * qty_close) + pnl
+        return pnl
+
+    def _close(self, sym: str, pos: Position, price: float, ts: int, reason: str) -> Dict[str, Any]:
+        self._realize_partial(pos, price, pos.qty)
+        total = pos.realized
+        del self.positions[sym]
+        return {
+            "symbol": sym, "side": pos.side,
+            "entry": pos.entry, "exit": price,
+            "open_ts": pos.open_ts, "close_ts": ts,
+            "pnl": total, "reason": reason
+        }

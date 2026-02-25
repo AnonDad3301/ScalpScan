@@ -1,0 +1,44 @@
+from __future__ import annotations
+import random, time, math
+from typing import Any, Dict, List, Tuple
+
+def now_ms() -> int:
+    return int(time.time()*1000)
+
+class MockMarket:
+    def __init__(self, seed: int = 42):
+        random.seed(seed)
+
+    def fetch_symbols(self) -> List[Dict[str, Any]]:
+        syms = ["BTC/USDT","ETH/USDT","SOL/USDT","XRP/USDT","BNB/USDT","ADA/USDT","DOGE/USDT","AVAX/USDT","LINK/USDT","TRX/USDT"]
+        return [{"symbol": s, "base": s.split('/')[0], "quote": s.split('/')[1], "active": True, "volume": random.random()*1e9} for s in syms]
+
+    def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> List[Tuple[int,float,float,float,float,float]]:
+        now = int(time.time()//60)*60
+        base = 1000.0 + (abs(hash(symbol)) % 50000)
+        price = base
+        out=[]
+        for i in range(limit):
+            ts=(now-(limit-1-i)*60)*1000
+            drift=math.sin((ts/1000)/300.0)*5.0
+            shock=(random.random()-0.5)*12.0
+            close=max(1.0, price+drift+shock)
+            high=close+random.random()*5.0
+            low=close-random.random()*5.0
+            open_=price
+            vol=random.random()*100.0
+            out.append((ts, open_, high, low, close, vol))
+            price=close
+        return out
+
+    def fetch_orderbook(self, symbol: str, depth: int=50) -> Dict[str, Any]:
+        spread = random.random()*2.0
+        imb = (random.random()-0.5)*0.6
+        return {"ts": now_ms(), "depth": depth, "spread": spread, "imbalance": imb, "bid_vol": 1000.0, "ask_vol": 900.0}
+
+    def fetch_prices(self, symbols: List[str]) -> Dict[str, float]:
+        # live-ish prices for mock: last close of short fetch
+        out={}
+        for s in symbols:
+            out[s] = 1000.0 + (abs(hash(s)) % 50000) + random.random()*10.0
+        return out

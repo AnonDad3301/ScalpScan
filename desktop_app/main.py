@@ -1,0 +1,487 @@
+from __future__ import annotations
+import asyncio, csv, json, os, sys, time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from PySide6 import QtCore, QtWidgets
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
+from PySide6.QtCore import Qt, Signal
+import websockets
+from websockets.legacy.client import connect as legacy_connect
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from packages.common.config import Config
+from packages.infra.event_store.sqlite_store import SQLiteEventStore
+from packages.infra.trades_store.sqlite_trades import TradesStore
+
+def fmt_ts(ts_ms: Any) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ts_ms)/1000))
+    except Exception:
+        return ""
+
+class WSClient(QtCore.QThread):
+    message = Signal(dict)
+    status = Signal(str)
+    connected = Signal(bool)
+
+    def __init__(self, url: str):
+        super().__init__()
+        self.url = url
+        self._stop = False
+        self._out_q: Optional[asyncio.Queue] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def stop(self):
+        self._stop = True
+        if self._loop:
+            self._loop.call_soon_threadsafe(lambda: None)
+
+    def send_cmd(self, cmd: str, **kwargs):
+        payload = {"type":"cmd","ts":int(time.time()*1000),"cmd":cmd}
+        payload.update(kwargs)
+        if self._loop and self._out_q:
+            def _put():
+                try:
+                    self._out_q.put_nowait(payload)
+                except Exception:
+                    pass
+            self._loop.call_soon_threadsafe(_put)
+
+    def run(self):
+        asyncio.run(self._main())
+
+    async def _main(self):
+        self._loop = asyncio.get_running_loop()
+        self._out_q = asyncio.Queue()
+        while not self._stop:
+            try:
+                self.status.emit(f"WS connect: {self.url}")
+                async with legacy_connect(self.url, ping_interval=None, ping_timeout=None) as ws:
+                    self.connected.emit(True)
+                    self.status.emit("WS connected")
+
+                    async def sender():
+                        while not self._stop:
+                            msg = await self._out_q.get()
+                            try:
+                                await ws.send(json.dumps(msg, ensure_ascii=False))
+                            except Exception:
+                                break
+
+                    send_task = asyncio.create_task(sender())
+                    try:
+                        async for raw in ws:
+                            if self._stop:
+                                break
+                            try:
+                                self.message.emit(json.loads(raw))
+                            except Exception:
+                                continue
+                    finally:
+                        send_task.cancel()
+                        self.connected.emit(False)
+            except Exception as e:
+                self.connected.emit(False)
+                self.status.emit(f"WS reconnect in 1s: {e}")
+                await asyncio.sleep(1.0)
+
+class Table(QtWidgets.QTableWidget):
+    def __init__(self, headers: List[str]):
+        super().__init__(0, len(headers))
+        self.setHorizontalHeaderLabels(headers)
+        self.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.setAlternatingRowColors(True)
+        self.verticalHeader().setVisible(False)
+
+    def set_rows(self, rows: List[List[Any]]):
+        self.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            for c, val in enumerate(row):
+                item = QtWidgets.QTableWidgetItem("" if val is None else str(val))
+                if c == 0:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                else:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                self.setItem(r, c, item)
+
+SimpleTable = Table
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self, cfg: Dict[str, Any], cfg_path: Path):
+        super().__init__()
+        self.cfg = cfg
+        self.cfg_path = cfg_path
+        self.root_dir = os.path.dirname(os.path.abspath(cfg_path))
+        self.setWindowTitle("ScalpForge Desktop v1.4.3 (No Docker)")
+        self.resize(1600, 1000)
+
+        rt = cfg.get("runtime", {})
+        host = rt.get("ws_host", "127.0.0.1")
+        port = int(rt.get("ws_port", 8765))
+        self.ws_url = f"ws://{host}:{port}"
+
+        self.es = SQLiteEventStore(os.path.join(self.root_dir, cfg["storage"]["events_db"]))
+        self.trades = TradesStore(os.path.join(self.root_dir, cfg["storage"].get("trades_db","data/trades.sqlite")))
+
+        # state
+        self.ws_connected = False
+        self.last_ws_msg_ts = 0
+        self.preflight_ok = False
+        self.preflight_report: List[Dict[str, Any]] = []
+        self.symbols: List[str] = []
+        self.events: List[Dict[str, Any]] = []
+        self.prices: Dict[str, float] = {}
+        self.positions: Dict[str, Any] = {}
+        self.account: Dict[str, Any] = {"deposit": None, "cash": None, "equity": None, "open_positions": None}
+        self.model_health: Dict[str, Any] = {}
+
+        # UI
+        self.tabs = QtWidgets.QTabWidget()
+        self.setCentralWidget(self.tabs)
+
+        self._tab_preflight()
+        self._tab_panel()
+        self._tab_scanner()
+        self._tab_model()
+        self._tab_trace()
+        self._tab_instruments()
+        self._tab_closed()
+        self._tab_monitor()
+        self._tab_modelb()
+        self._tab_dataset()
+        self._tab_mlops()
+        self._tab_levels()
+        self._tab_logs()
+
+        # WS (commands only)
+        self.ws = WSClient(self.ws_url)
+        self.ws.message.connect(self.on_message)
+        self.ws.status.connect(self.on_status)
+        self.ws.connected.connect(self.on_connected)
+        self.ws.start()
+
+        # Poll sqlite (source of truth)
+        self.poller = QtCore.QTimer()
+        self.poller.timeout.connect(self.poll_sqlite)
+        self.poller.start(500)
+
+        # Render refresh
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.refresh_ui)
+        self.timer.start(250)
+
+        QtCore.QTimer.singleShot(800, lambda: self.ws.send_cmd("run_preflight"))
+        QtCore.QTimer.singleShot(1200, lambda: self.ws.send_cmd("get_symbols", limit=2000))
+
+    def closeEvent(self, e):
+        try:
+            self.ws.stop()
+            self.ws.wait(1000)
+        except Exception:
+            pass
+        super().closeEvent(e)
+
+    # Tabs
+    def _tab_preflight(self):
+        w = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(w)
+        self.lbl_status = QtWidgets.QLabel("Статус: —")
+        self.lbl_live = QtWidgets.QLabel("Live: —")
+        self.lbl_pf = QtWidgets.QLabel("Предпроверка: —")
+        self.lbl_pf.setStyleSheet("font-size:16px; font-weight:700;")
+        lay.addWidget(self.lbl_status)
+        lay.addWidget(self.lbl_live)
+        lay.addWidget(self.lbl_pf)
+        self.tbl_pf = Table(["Проверка", "OK", "Детали"])
+        lay.addWidget(self.tbl_pf)
+
+        row = QtWidgets.QHBoxLayout()
+        self.btn_pf = QtWidgets.QPushButton("Запустить предпроверку")
+        self.btn_start = QtWidgets.QPushButton("▶ Старт сканера")
+        self.btn_stop = QtWidgets.QPushButton("■ Стоп")
+        self.btn_syms = QtWidgets.QPushButton("Обновить инструменты")
+        self.btn_pf.clicked.connect(lambda: self.ws.send_cmd("run_preflight"))
+        self.btn_start.clicked.connect(lambda: self.ws.send_cmd("start"))
+        self.btn_stop.clicked.connect(lambda: self.ws.send_cmd("stop"))
+        self.btn_syms.clicked.connect(lambda: self.ws.send_cmd("get_symbols", limit=4000))
+        row.addWidget(self.btn_pf); row.addWidget(self.btn_start); row.addWidget(self.btn_stop); row.addWidget(self.btn_syms); row.addStretch(1)
+        lay.addLayout(row)
+
+        self.tabs.addTab(w, "Предпроверка")
+
+    def _tab_panel(self):
+        w = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(w)
+        grid = QtWidgets.QGridLayout()
+        self.kpi_deposit = QtWidgets.QLabel("Депозит: —")
+        self.kpi_cash = QtWidgets.QLabel("Cash: —")
+        self.kpi_equity = QtWidgets.QLabel("Equity: —")
+        self.kpi_open = QtWidgets.QLabel("Позиции: —")
+        for i, lab in enumerate([self.kpi_deposit, self.kpi_cash, self.kpi_equity, self.kpi_open]):
+            lab.setStyleSheet("font-size:18px; font-weight:700;")
+            grid.addWidget(lab, 0, i)
+        lay.addLayout(grid)
+        self.tbl_positions = Table(["Символ","Сторона","Цена","Вход","Qty","PnL","SL","TP1","TP2"])
+        lay.addWidget(self.tbl_positions)
+        self.tabs.addTab(w, "Панель")
+
+    def _tab_scanner(self):
+        w=QtWidgets.QWidget(); lay=QtWidgets.QVBoxLayout(w)
+        self.tbl_signals=Table(["Время","Символ","Направление","Pred","Conf","Gate","Причины"])
+        lay.addWidget(self.tbl_signals)
+        self.tabs.addTab(w,"Сканер")
+
+    def _tab_model(self):
+        w=QtWidgets.QWidget(); lay=QtWidgets.QVBoxLayout(w)
+        grid=QtWidgets.QGridLayout(); lay.addLayout(grid)
+        self.m_samples=QtWidgets.QLabel("Samples: —")
+        self.m_auc=QtWidgets.QLabel("AUC: —")
+        self.m_acc=QtWidgets.QLabel("Accuracy: —")
+        self.m_ver=QtWidgets.QLabel("Version: —")
+        for i,lab in enumerate([self.m_samples,self.m_auc,self.m_acc,self.m_ver]):
+            lab.setStyleSheet("font-size:16px; font-weight:600;"); grid.addWidget(lab,0,i)
+        self.tbl_model=Table(["Время","Символ","Pred","Conf","AUC","Samples"])
+        lay.addWidget(self.tbl_model)
+        self.tabs.addTab(w,"Модель/Обучение")
+
+    def _tab_trace(self):
+        w=QtWidgets.QWidget(); lay=QtWidgets.QVBoxLayout(w)
+        self.tbl_trace=Table(["Время","run_id","Символ","Этап","Уровень","Payload"])
+        lay.addWidget(self.tbl_trace)
+        self.tabs.addTab(w,"Трассировка")
+
+    def _tab_instruments(self):
+        w=QtWidgets.QWidget(); lay=QtWidgets.QVBoxLayout(w)
+        self.tbl_syms=Table(["#", "Symbol"]); lay.addWidget(self.tbl_syms)
+        self.tabs.addTab(w,"Инструменты")
+
+    def _tab_closed(self):
+        w=QtWidgets.QWidget(); lay=QtWidgets.QVBoxLayout(w)
+        self.tbl_closed=Table(["CloseTime","Symbol","Side","Entry","Exit","PnL","Reason"])
+        lay.addWidget(self.tbl_closed)
+        self.tabs.addTab(w,"Завершенные")
+
+    def _tab_monitor(self):
+        w=QtWidgets.QWidget(); lay=QtWidgets.QVBoxLayout(w)
+        info=QtWidgets.QLabel("Мониторинг: хвост событий PRICE_TICK/ERROR из events.sqlite и telemetry (если включено).")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        self.txt_mon=QtWidgets.QPlainTextEdit()
+        self.txt_mon.setReadOnly(True)
+        lay.addWidget(self.txt_mon)
+        btn=QtWidgets.QPushButton("Обновить")
+        btn.clicked.connect(self._refresh_monitor)
+        lay.addWidget(btn)
+        self.tabs.addTab(w,"Мониторинг")
+
+    def _tab_logs(self):
+        w=QtWidgets.QWidget(); lay=QtWidgets.QVBoxLayout(w)
+        row=QtWidgets.QHBoxLayout(); lay.addLayout(row)
+        self.btn_export_csv=QtWidgets.QPushButton("Экспорт CSV")
+        self.btn_export_json=QtWidgets.QPushButton("Экспорт JSON")
+        row.addWidget(self.btn_export_csv); row.addWidget(self.btn_export_json); row.addStretch(1)
+        self.txt_log=QtWidgets.QPlainTextEdit(); self.txt_log.setReadOnly(True); lay.addWidget(self.txt_log)
+        self.btn_export_csv.clicked.connect(self.export_csv)
+        self.btn_export_json.clicked.connect(self.export_json)
+        self.tabs.addTab(w,"Логи/Экспорт")
+
+    # WS handlers
+    def on_connected(self, ok: bool):
+        self.ws_connected = ok
+
+    def on_status(self, s: str):
+        self.lbl_status.setText("Статус: " + s)
+
+    def on_message(self, msg: Dict[str, Any]):
+        self.last_ws_msg_ts = int(time.time()*1000)
+        t = msg.get("type")
+        if t == "preflight":
+            self.preflight_ok = bool(msg.get("ok", False))
+            self.preflight_report = msg.get("report", []) or []
+        elif t == "symbols":
+            self.symbols = msg.get("symbols", []) or []
+        elif t == "status":
+            self.txt_log.appendPlainText(str(msg.get("status")))
+
+    # SQLite polling (IMPORTANT: tail() returns newest first)
+    def poll_sqlite(self):
+        tail = self.es.tail(2500)  # newest first
+        self.events = list(reversed(tail))  # for tables (oldest->newest)
+
+        for e in tail:
+            if e.get("stage") == "PRICES_SNAPSHOT":
+                self.prices = (e.get("payload", {}).get("prices") or {})
+                break
+        for e in tail:
+            if e.get("stage") == "POSITIONS_SNAPSHOT":
+                self.positions = (e.get("payload", {}).get("positions") or {})
+                break
+        for e in tail:
+            if e.get("stage") == "ACCOUNT":
+                p = e.get("payload", {})
+                self.account = {"deposit": p.get("deposit"), "cash": p.get("cash"), "equity": p.get("equity"), "open_positions": p.get("open_positions")}
+                break
+        for e in tail:
+            if e.get("stage") == "MODEL_INFERRED":
+                mh = (e.get("payload", {}).get("metrics") or {})
+                if mh:
+                    self.model_health = mh
+                break
+
+    def refresh_ui(self):
+        now = int(time.time()*1000)
+        age = (now - self.last_ws_msg_ts) if self.last_ws_msg_ts else None
+        self.lbl_live.setText(f"Live: WS={'OK' if self.ws_connected else 'NO'} | last_msg={age}ms" if age is not None else f"Live: WS={'OK' if self.ws_connected else 'NO'}")
+
+        self.lbl_pf.setText("Предпроверка: " + ("OK ✅" if self.preflight_ok else "НЕ ПРОЙДЕНА ❌"))
+        self.tbl_pf.set_rows([[r.get("name"), "OK" if r.get("ok") else "FAIL", r.get("details","")] for r in (self.preflight_report or [])])
+        self.btn_start.setEnabled(bool(self.preflight_ok))
+
+        dep = self.account.get("deposit"); cash = self.account.get("cash"); eq = self.account.get("equity"); op = self.account.get("open_positions")
+        self.kpi_deposit.setText(f"Депозит: ${float(dep):.2f}" if dep is not None else "Депозит: —")
+        self.kpi_cash.setText(f"Cash: ${float(cash):.2f}" if cash is not None else "Cash: —")
+
+        total_unr = 0.0
+        for sym, p in (self.positions or {}).items():
+            side = p.get("side")
+            entry = float(p.get("entry", 0.0)); qty = float(p.get("qty", 0.0))
+            px = float(self.prices.get(sym, entry))
+            total_unr += (px-entry)*qty if side == "LONG" else (entry-px)*qty
+        self.kpi_equity.setText(f"Equity: ${float(eq):.2f} (uPnL {total_unr:+.2f})" if eq is not None else "Equity: —")
+        self.kpi_open.setText(f"Позиции: {op}" if op is not None else "Позиции: —")
+
+        # positions
+        pos_rows=[]
+        for sym,p in (self.positions or {}).items():
+            side=p.get("side")
+            entry=float(p.get("entry",0.0)); qty=float(p.get("qty",0.0))
+            price=float(self.prices.get(sym, entry))
+            pnl=(price-entry)*qty if side=="LONG" else (entry-price)*qty
+            pos_rows.append([sym,"ЛОНГ" if side=="LONG" else "ШОРТ",f"{price:.6f}",f"{entry:.6f}",f"{qty:.6f}",f"{pnl:.2f}",
+                             f"{float(p.get('sl',0.0)):.6f}",f"{float(p.get('tp1',0.0)):.6f}",f"{float(p.get('tp2',0.0)):.6f}"])
+        self.tbl_positions.set_rows(pos_rows)
+
+        # signals/model/trace
+        sig_rows=[]; model_rows=[]; trace_rows=[]
+        for e in self.events[-1400:]:
+            ts=fmt_ts(e.get("ts")); sym=e.get("symbol"); stg=e.get("stage"); lvl=e.get("level"); payload=e.get("payload",{})
+            if stg=="SIGNAL":
+                gate=payload.get("gate",{}) or {}
+                sig_rows.append([ts,sym,payload.get("direction"),payload.get("pred"),payload.get("confidence"),gate.get("decision"),";".join(gate.get("reasons",[]) or [])])
+            if stg=="MODEL_INFERRED":
+                mh=(payload.get("metrics") or {})
+                model_rows.append([ts,sym,payload.get("pred"),payload.get("confidence"),mh.get("auc"),mh.get("samples")])
+            trace_rows.append([ts,str(e.get("run_id",""))[:8],sym,stg,lvl,json.dumps(payload,ensure_ascii=False)[:800]])
+        self.tbl_signals.set_rows(sig_rows[-350:])
+        self.tbl_model.set_rows(model_rows[-350:])
+        self.tbl_trace.set_rows(trace_rows[-500:])
+
+        mh=self.model_health or {}
+        self.m_samples.setText(f"Samples: {int(mh.get('samples',0))}")
+        self.m_auc.setText(f"AUC: {float(mh.get('auc',0.0)):.3f}")
+        self.m_acc.setText(f"Accuracy: {float(mh.get('accuracy',0.0)):.3f}")
+        self.m_ver.setText(f"Version: {mh.get('version','')}")
+
+        self.tbl_syms.set_rows([[i+1, s] for i,s in enumerate(self.symbols[:4000])])
+
+        # closed trades
+        closed_rows=[]
+        for e in self.events[-4000:]:
+            if e.get("stage")=="TRADE_CLOSED":
+                p=e.get("payload",{})
+                try:
+                    closed_rows.append([fmt_ts(p.get("close_ts")), p.get("symbol"), p.get("side"),
+                                        f"{float(p.get('entry',0.0)):.6f}", f"{float(p.get('exit',0.0)):.6f}",
+                                        f"{float(p.get('pnl',0.0)):.2f}", p.get("reason")])
+                except Exception:
+                    pass
+        self.tbl_closed.set_rows(closed_rows[-700:])
+
+    def _refresh_monitor(self):
+        # Show last PRICE_TICK + ERROR events
+        buf=[]
+        last_pt=None
+        for e in reversed(self.events):
+            if e.get('stage')=='PRICE_TICK':
+                last_pt=e; break
+        if last_pt:
+            age_ms=int(time.time()*1000)-int(last_pt.get('ts') or 0)
+            buf.append(f"LAST PRICE_TICK age_ms={age_ms} payload={json.dumps(last_pt.get('payload',{}), ensure_ascii=False)}")
+            buf.append('')
+
+        for e in self.events[-500:]:
+            if e.get("stage") in ("PRICE_TICK","ERROR","TRADE_OPEN","TRADE_CLOSED"):
+                buf.append(f"{fmt_ts(e.get('ts'))} {e.get('stage')} {e.get('symbol')} {json.dumps(e.get('payload',{}), ensure_ascii=False)[:500]}")
+        self.txt_mon.setPlainText("\n".join(buf[-250:]) if buf else "Пока нет событий. Запусти hub и нажми Старт сканера.")
+
+    def export_csv(self):
+        out_dir = ROOT / "exports"
+        out_dir.mkdir(exist_ok=True)
+        fp = out_dir / f"events_{int(time.time())}.csv"
+        with fp.open("w", newline="", encoding="utf-8") as f:
+            wr = csv.writer(f)
+            wr.writerow(["ts","run_id","symbol","stage","level","payload"])
+            for e in self.events:
+                wr.writerow([e.get("ts"), e.get("run_id"), e.get("symbol"), e.get("stage"), e.get("level"), json.dumps(e.get("payload",{}), ensure_ascii=False)])
+        self.txt_log.appendPlainText(f"exported {fp}")
+
+    def export_json(self):
+        out_dir = ROOT / "exports"
+        out_dir.mkdir(exist_ok=True)
+        fp = out_dir / f"events_{int(time.time())}.json"
+        fp.write_text(json.dumps(self.events, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.txt_log.appendPlainText(f"exported {fp}")
+
+    def _tab_modelb(self):
+        w=QWidget(); lay=QVBoxLayout(w)
+        self.lbl_modelb=QLabel("Model-B: нет данных"); lay.addWidget(self.lbl_modelb)
+        btns=QHBoxLayout()
+        b1=QPushButton("Force retrain"); b1.clicked.connect(lambda: write_cmd(self.cfg, "force_model_b_retrain"))
+        b2=QPushButton("Disable training"); b2.clicked.connect(lambda: write_cmd(self.cfg, "disable_model_b_training"))
+        b3=QPushButton("Enable training"); b3.clicked.connect(lambda: write_cmd(self.cfg, "enable_model_b_training"))
+        b4=QPushButton("Rollback"); b4.clicked.connect(lambda: write_cmd(self.cfg, "rollback_model_b"))
+        for b in (b1,b2,b3,b4): btns.addWidget(b)
+        lay.addLayout(btns)
+        self.tbl_modelb=SimpleTable(["Time","Symbol","Prob(head)","Prob(backbone)","wall_age","touches","dist_bps","Decision","thr","Status"])
+        lay.addWidget(self.tbl_modelb)
+        self.tabs.addTab(w, "Model-B")
+
+    def _tab_dataset(self):
+        w=QWidget(); lay=QVBoxLayout(w)
+        self.lbl_ds=QLabel("Dataset: 0 rows"); lay.addWidget(self.lbl_ds)
+        self.tbl_ds=SimpleTable(["Rows","Label1%","Last ts","Path"])
+        lay.addWidget(self.tbl_ds)
+        self.tabs.addTab(w, "Dataset")
+
+    def _tab_mlops(self):
+        w=QWidget(); lay=QVBoxLayout(w)
+        self.lbl_mlops=QLabel("MLOps: нет retrain"); lay.addWidget(self.lbl_mlops)
+        self.tbl_mlops=SimpleTable(["Time","AUC","PR_AUC","ACC","Samples","Promoted"])
+        lay.addWidget(self.tbl_mlops)
+        self.tabs.addTab(w, "MLOps")
+
+    def _tab_levels(self):
+        w=QWidget(); lay=QVBoxLayout(w)
+        self.tbl_levels=SimpleTable(["Time","Symbol","imb","spread_bps","wall_age","touches","dist_bps"])
+        lay.addWidget(self.tbl_levels)
+        self.tabs.addTab(w, "Levels/OB")
+
+
+def main():
+    cfg_path = ROOT / "config.yaml"
+    cfg = Config.load(str(cfg_path)).raw
+    app = QtWidgets.QApplication(sys.argv)
+    w = MainWindow(cfg, cfg_path)
+    w.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
+
+

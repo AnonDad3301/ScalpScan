@@ -1,0 +1,90 @@
+runtime:
+  adapter: ccxt
+  exchange: bybit
+  market: perp
+  testnet: false
+  ws_stale_resub_ms: 3000
+  ws_stale_reconnect_ms: 10000
+  timeframe: 1m
+  lookback: 300
+  max_pairs: 50
+  tick_interval_sec: 2.0
+  tick_timeout_sec: 25.0
+  price_interval_sec: 1.0
+  price_timeout_sec: 1.0
+  ws_host: 127.0.0.1
+  ws_port: 8766
+  ccxt:
+    options:
+      defaultType: swap
+      defaultSubType: linear
+universe:
+  mode: db
+  custom_symbols:
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+  quote:
+  - USDT
+  - USDC
+  min_volume: 0
+features:
+  invariants:
+    rsi_range:
+    - 0
+    - 100
+    adx_range:
+    - 0
+    - 100
+    atr_min: 1e-12
+    forbid_nan: true
+model:
+  k: 35
+  min_samples: 50
+  min_auc: 0.52
+  auc_warmup_samples: 600
+  forward: 4
+gate:
+  profile: scalp
+  profiles:
+    scalp:
+      entry_threshold: 0.06
+      confidence_min: 0.52
+      adx_min: 8
+      spread_max: 1.5
+      volz_max: 3.5
+execution:
+  deposit_usd: 2000
+  risk_usd: 50
+  max_positions: 20
+  per_trade_alloc_pct: 0.15
+  total_alloc_pct: 0.6
+  fees_bps: 2.0
+  slippage_bps: 1.0
+  exits:
+    sl_atr_mult: 1.2
+    tp1_atr_mult: 1.1
+    tp2_atr_mult: 1.7
+    tp1_fraction: 0.5
+    breakeven_r: 0.8
+    trailing:
+      start_r: 1.0
+      step_r: 0.5
+    time_stop_minutes: 35
+storage:
+  model_registry: data/model_registry
+  model_b_dataset: data/datasets/model_b_samples.csv
+  commands_file: data/ui_commands.jsonl
+  data_dir: data
+  events_db: ./data/events.sqlite
+  symbols_db: ./data/symbols.sqlite
+  snapshots_dir: ./data/snapshots
+  models_dir: ./data/models
+  trades_db: data/trades.sqlite
+model_b:
+  hf_id: ibm-research/patchtst-fm-r1
+  cache_dir: data/hf_cache
+  device: cpu
+pricing:
+  price_source: mark
+  timezone: UTC
