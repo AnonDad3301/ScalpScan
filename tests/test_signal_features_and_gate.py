@@ -34,11 +34,16 @@ class SignalFeatureGateTests(unittest.TestCase):
             "forecast_uncertainty": 0.005,
             "rr_ratio": 1.8,
             "trend_strength": 0.4,
+            "regime": "trend",
+            "tp_return": 0.01,
+            "sl_return": 0.006,
+            "costs_bps": 3.0,
+            "sl_streak": 0,
         }
         out = decide(
             features,
             inv_results=[{"pass": True}],
-            model_out={"confidence": 0.8, "pred": 0.2},
+            model_out={"confidence": 0.8, "pred": 0.2, "p_tp_first": 0.62, "model_a_direction": "LONG", "model_b_direction": "LONG"},
             model_health={"samples": 700, "auc": 0.65},
             cfg={
                 "profile": "scalp",
@@ -71,11 +76,16 @@ class SignalFeatureGateTests(unittest.TestCase):
             "forecast_uncertainty": 0.005,
             "rr_ratio": 1.1,
             "trend_strength": 0.2,
+            "regime": "trend",
+            "tp_return": 0.01,
+            "sl_return": 0.005,
+            "costs_bps": 3.0,
+            "sl_streak": 0,
         }
         out = decide(
             features,
             inv_results=[{"pass": True}],
-            model_out={"confidence": 0.75, "pred": 0.2},
+            model_out={"confidence": 0.75, "pred": 0.2, "p_tp_first": 0.65, "model_a_direction": "LONG", "model_b_direction": "LONG"},
             model_health={"samples": 800, "auc": 0.45},
             cfg={
                 "profile": "scalp",

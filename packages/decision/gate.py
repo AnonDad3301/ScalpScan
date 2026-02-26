@@ -13,6 +13,9 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
     uncertainty_max = float(prof.get("uncertainty_max", 0.02))
     rr_min = float(prof.get("rr_min", 0.9))
     trend_strength_min = float(prof.get("trend_strength_min", 0.05))
+    ev_min = float(prof.get("ev_min", 0.0))
+    high_vol_conf_boost = float(prof.get("high_vol_conf_boost", 0.08))
+    cooldown_after_sl = int(prof.get("cooldown_after_sl", 3))
 
     rules = []
     reasons = []
@@ -42,6 +45,9 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
         else:
             add("MODEL_AUC_MIN", auc_ok, auc, min_auc)
 
+    regime = str(features.get("regime", "unknown"))
+    if regime == "high_volatility":
+        conf_min = min(0.99, conf_min + high_vol_conf_boost)
     add("CONFIDENCE_MIN", conf >= conf_min, conf, conf_min)
 
     pred = float(model_out.get("pred", 0.0))
@@ -65,6 +71,23 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
     trend_strength = float(features.get("trend_strength", 0.0))
     add("TREND_STRENGTH_MIN", trend_strength >= trend_strength_min, trend_strength, trend_strength_min)
 
+    add("REGIME_NOT_LOW_LIQ", regime != "low_liquidity", regime, "!=low_liquidity")
+
+    model_a_direction = str(model_out.get("model_a_direction", ""))
+    model_b_direction = str(model_out.get("model_b_direction", ""))
+    agree = bool(model_a_direction) and (model_a_direction == model_b_direction)
+    add("DIRECTIONAL_AGREEMENT", agree, f"{model_a_direction}/{model_b_direction}", "same")
+
+    costs = float(features.get("costs_bps", 0.0)) / 10000.0
+    tp = float(features.get("tp_return", 0.0))
+    sl = float(features.get("sl_return", 0.0))
+    p = float(model_out.get("p_tp_first", 0.5))
+    ev = p * tp - (1.0 - p) * sl - costs
+    add("EV_POSITIVE", ev > ev_min, ev, ev_min)
+
+    sl_streak = int(features.get("sl_streak", 0))
+    add("COOLDOWN_AFTER_SL", sl_streak < cooldown_after_sl, sl_streak, cooldown_after_sl)
+
     decision = "PASS" if all(r["pass"] for r in rules) else "FAIL"
     return {
         "decision": decision,
@@ -82,4 +105,7 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
         "forecast_uncertainty": unc,
         "rr_ratio": rr,
         "trend_strength": trend_strength,
+        "regime": regime,
+        "expected_value": ev,
+        "sl_streak": sl_streak,
     }

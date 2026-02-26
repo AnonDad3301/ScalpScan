@@ -8,6 +8,8 @@ import numpy as np
 from packages.feature.pipeline import compute as compute_features
 from packages.feature.invariants import check as inv_check, ok as inv_ok
 from packages.model.trainer import OnlineTrainer
+from packages.model.ensemble import meta_decide
+from packages.model.labeling import triple_barrier_labels
 from packages.features.orderbook_tracker import OrderBookTracker
 from packages.features.feature_engine import ohlcv_to_channels, pack_model_b_tensor
 from packages.model.model_b_patchtst import ModelBPatchTST
@@ -83,6 +85,7 @@ class Engine:
             trend_threshold=float(mod_cfg.get('regime_trend_threshold', 0.25)),
         )
         self._open_feature_bank: Dict[str, np.ndarray] = {}
+        self._sl_streak: int = 0
 
 
     def sync_symbols(self) -> int:
@@ -199,6 +202,12 @@ class Engine:
                 feats["forecast_ret"] = forecast_ret
                 feats["rr_ratio"] = float(rr_ratio)
                 feats["trend_strength"] = float(trend_strength)
+                feats["regime"] = str(getattr(regime, "regime", "unknown"))
+                fees_bps = float(self.cfg.get("execution", {}).get("fees_bps", 0.0)) + float(self.cfg.get("execution", {}).get("slippage_bps", 0.0))
+                feats["costs_bps"] = fees_bps
+                feats["tp_return"] = float(abs((feats.get("tp1", last_close) - last_close) / max(1e-12, last_close))) if feats.get("tp1") is not None else 0.0
+                feats["sl_return"] = float(abs((last_close - feats.get("sl", last_close)) / max(1e-12, last_close))) if feats.get("sl") is not None else 0.0
+                feats["sl_streak"] = float(self._sl_streak)
 
                 try:
                     walls = self.ob_tracker.strongest_walls(sym, last_close, topk=3)
@@ -220,7 +229,14 @@ class Engine:
                     }))
 
                 fwd=int(self.cfg["model"].get("forward",4))
-                y=label_forward(arr, fwd)
+                atr_series = np.full(len(arr), float(feats.get("atr", 0.0)), dtype=float)
+                y, y_tp, y_sl = triple_barrier_labels(
+                    arr,
+                    atr_series,
+                    horizon_bars=max(3, min(5, fwd)),
+                    tp_atr_mult=float(self.cfg.get("execution", {}).get("exits", {}).get("tp1_atr_mult", 1.1)),
+                    sl_atr_mult=float(self.cfg.get("execution", {}).get("exits", {}).get("sl_atr_mult", 1.2)),
+                )
                 X=np.array([[feats["rsi"],feats["atr"],feats["adx"],feats["ob_imb"],feats["spread"]] for _ in range(len(arr))], dtype=float)
 
                 added=self.trainer.add_samples(X[:-fwd], y[:-fwd])
@@ -228,9 +244,12 @@ class Engine:
 
                 x_last=X[-1]
                 mout=self.trainer.infer(x_last)
+                p_a_up3 = float(max(0.0, min(1.0, 0.5 + 0.5 * mout.get("pred", 0.0))))
+                p_a_up5 = float(max(0.0, min(1.0, 0.5 + 0.35 * mout.get("pred", 0.0))))
                 mhealth=self.trainer.health()
                 self.es.append(mk_event(env,"MODEL_INFERRED","INFO",{
                     "pred":mout["pred"],"confidence":mout["confidence"],
+                    "p_up_3m": p_a_up3, "p_up_5m": p_a_up5,
                     "metrics":mhealth,"samples_added":added
                 }))
 
@@ -293,13 +312,41 @@ class Engine:
                 except Exception as e:
                     self.es.append(mk_event(env,"ERROR","ERROR",{"where":"MODEL_B_SHADOW","err":str(e)}))
 
-                direction="NEUTRAL"
-                entry_th=float(self.cfg["gate"]["profiles"][self.cfg["gate"]["profile"]]["entry_threshold"])
-                if mout["pred"]>=entry_th: direction="LONG"
-                elif mout["pred"]<=-entry_th: direction="SHORT"
+                regime_name = str(getattr(regime, "regime", "unknown"))
+                model_b_prob = float(locals().get("prob", 0.5))
+                ensemble_cfg = ((self.cfg.get("model", {}) or {}).get("ensemble", {}) or {})
+                ens = meta_decide(
+                    model_a={"p_up_3m": p_a_up3, "p_up_5m": p_a_up5},
+                    model_b={"p_up_3m": model_b_prob, "p_up_5m": model_b_prob},
+                    regime=regime_name,
+                    cfg=ensemble_cfg,
+                )
+                ens_d = ens.as_dict()
+                self.es.append(mk_event(env, "ENSEMBLE_INFERRED", "INFO", ens_d))
+                mout["p_tp_first"] = ens_d.get("p_tp_first", 0.5)
+                mout["p_sl_first"] = ens_d.get("p_sl_first", 0.5)
+                mout["pred"] = (ens_d.get("p_up_3m", 0.5) - 0.5) * 2.0
+                mout["confidence"] = ens_d.get("confidence", mout.get("confidence", 0.5))
+                mout["model_a_direction"] = "LONG" if p_a_up3 >= 0.5 else "SHORT"
+                mout["model_b_direction"] = "LONG" if model_b_prob >= 0.5 else "SHORT"
+
+                direction = str(ens_d.get("direction", "NEUTRAL"))
+                if ens_d.get("no_trade_reason"):
+                    gate["decision"] = "FAIL"
+                    gate.setdefault("reasons", []).append(f"ENSEMBLE_{str(ens_d.get('no_trade_reason', 'no_trade')).upper()}")
 
                 self.es.append(mk_event(env,"SIGNAL","INFO",{
-                    "direction":direction,"pred":mout["pred"],"confidence":mout["confidence"],"gate":gate,
+                    "direction":direction,
+                    "pred":mout["pred"],
+                    "confidence":mout["confidence"],
+                    "signal_strength": ens_d.get("signal_strength", 0.0),
+                    "p_up_3m": ens_d.get("p_up_3m", 0.5),
+                    "p_up_5m": ens_d.get("p_up_5m", 0.5),
+                    "p_tp_first": ens_d.get("p_tp_first", 0.5),
+                    "p_sl_first": ens_d.get("p_sl_first", 0.5),
+                    "market_regime": feats.get("regime"),
+                    "decision_reasons": gate.get("reasons", [])[:3],
+                    "gate":gate,
                     "entry": last_close, "sl": feats.get("sl"), "tp1": feats.get("tp1"), "tp2": feats.get("tp2")
                 }))
 
@@ -387,6 +434,11 @@ class Engine:
             for c in closed:
                 self.es.append(mk_event(base, "TRADE_CLOSED", "INFO", c))
                 try:
+                    reason = str(c.get("reason", ""))
+                    if reason == "SL":
+                        self._sl_streak += 1
+                    elif reason in ("TP2", "TIME_STOP"):
+                        self._sl_streak = 0
                     sym = str(c.get("symbol", ""))
                     x = self._open_feature_bank.pop(sym, None)
                     pnl = float(c.get("pnl", 0.0) or 0.0)
