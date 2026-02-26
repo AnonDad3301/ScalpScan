@@ -139,6 +139,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.root_dir = os.path.dirname(os.path.abspath(cfg_path))
         self.setWindowTitle("ScalpForge Desktop v1.4.3 (No Docker)")
         self.resize(1600, 1000)
+        self._apply_theme()
 
         rt = cfg.get("runtime", {})
         host = rt.get("ws_host", "127.0.0.1")
@@ -200,6 +201,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
         QtCore.QTimer.singleShot(800, lambda: self.ws.send_cmd("run_preflight"))
         QtCore.QTimer.singleShot(1200, lambda: self.ws.send_cmd("get_symbols", limit=2000))
+
+
+    def _apply_theme(self):
+        ui = (self.cfg.get("ui", {}) or {})
+        theme = str(ui.get("theme", "light"))
+        if theme == "dark_green":
+            self.setStyleSheet("""
+                QWidget { background-color: #111111; color: #A8FF60; }
+                QTableWidget { gridline-color: #2a2a2a; selection-background-color: #1f3d1f; }
+                QHeaderView::section { background-color: #1a1a1a; color: #A8FF60; border: 1px solid #2a2a2a; }
+                QPushButton { background-color: #1b1b1b; color: #A8FF60; border: 1px solid #355e35; padding: 4px 8px; }
+                QLineEdit, QPlainTextEdit, QDoubleSpinBox, QComboBox { background-color: #1a1a1a; color: #A8FF60; border: 1px solid #355e35; }
+                QTabWidget::pane { border: 1px solid #2a2a2a; }
+            """)
 
     def closeEvent(self, e):
         try:
@@ -346,6 +361,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ed_tg_enabled = QtWidgets.QCheckBox("Telegram enabled")
         self.ed_tg_token = QtWidgets.QLineEdit()
         self.ed_tg_chat = QtWidgets.QLineEdit()
+        self.ed_timeframe = QtWidgets.QComboBox(); self.ed_timeframe.addItems(["1m","3m","5m","15m"])
+        self.ed_theme = QtWidgets.QComboBox(); self.ed_theme.addItems(["light","dark_green"])
 
         form.addRow("confidence_min (мин. уверенность)", self.ed_conf)
         form.addRow("rr_min (мин. RR)", self.ed_rr)
@@ -354,6 +371,8 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow("telegram.enabled", self.ed_tg_enabled)
         form.addRow("telegram.bot_token", self.ed_tg_token)
         form.addRow("telegram.chat_id", self.ed_tg_chat)
+        form.addRow("runtime.timeframe", self.ed_timeframe)
+        form.addRow("ui.theme", self.ed_theme)
         lay.addLayout(form)
 
         row=QHBoxLayout()
@@ -383,6 +402,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ed_tg_enabled.setChecked(bool(tg.get("enabled", False)))
             self.ed_tg_token.setText(str(tg.get("bot_token", "")))
             self.ed_tg_chat.setText(str(tg.get("chat_id", "")))
+            self.ed_timeframe.setCurrentText(str((c.get("runtime", {}) or {}).get("timeframe", "1m")))
+            self.ed_theme.setCurrentText(str((c.get("ui", {}) or {}).get("theme", "light")))
             self.lbl_settings.setText("Статус: настройки загружены")
         except Exception as e:
             self.lbl_settings.setText(f"Статус: ошибка загрузки ({e})")
@@ -406,9 +427,11 @@ class MainWindow(QtWidgets.QMainWindow):
             tg.setdefault("send_signal", True)
             tg.setdefault("send_trade_open", True)
             tg.setdefault("send_trade_closed", True)
+            c.setdefault("runtime", {})["timeframe"] = self.ed_timeframe.currentText()
+            c.setdefault("ui", {})["theme"] = self.ed_theme.currentText()
             with open(self.cfg_path, "w", encoding="utf-8") as f:
                 yaml.safe_dump(c, f, allow_unicode=True, sort_keys=False)
-            self.lbl_settings.setText("Статус: config сохранен. Перезапустите backend/hub.py")
+            self.lbl_settings.setText("Статус: config сохранен. Перезапустите backend/hub.py (и UI для темы)")
         except Exception as e:
             self.lbl_settings.setText(f"Статус: ошибка сохранения ({e})")
 
@@ -595,7 +618,7 @@ class MainWindow(QtWidgets.QMainWindow):
         be = int(st.get("breakeven", 0) or 0)
         loss = int(st.get("loss", 0) or 0)
         win_rate = float(st.get("win_rate", 0.0) or 0.0)
-        self.lbl_perf.setText(f"Сделки: total={total_closed}, wins={wins}, loss={loss}, SL={sl}, BE={be}, win_rate={win_rate:.1%}")
+        self.lbl_perf.setText(f"Сделки: всего={total_closed}, прибыльных={wins}, убыточных={loss}, SL={sl}, BE={be}, win_rate={win_rate:.1%}")
 
         prob_rows=[]
         for e in self.events[-1500:]:

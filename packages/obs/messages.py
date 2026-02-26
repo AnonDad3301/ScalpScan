@@ -7,6 +7,8 @@ CATALOG: Dict[str, Tuple[str, str]] = {
     "FEATURES_SNAPSHOT": ("Снимок фич", "Features snapshot"),
     "SETUP_EVENT": ("Событие сетапа", "Setup event"),
     "MODEL_INFERRED": ("Модель A: инференс", "Model A: inference"),
+    "MODEL_TRADE_SAMPLE": ("Модель A: sample из сделки", "Model A: sample from closed trade"),
+    "MODEL_RETRAIN_SKIPPED": ("Модель A: переобучение пропущено", "Model A: retrain skipped"),
     "GATE_DECISION": ("Решение гейта", "Gate decision"),
     "SIGNAL": ("Сигнал", "Signal"),
     "ORDER_NEW": ("Создан ордер", "Order created"),

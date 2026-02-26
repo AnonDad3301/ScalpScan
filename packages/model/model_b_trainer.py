@@ -48,10 +48,10 @@ class Trainer:
         self.last_metrics=m
         self.last_train_ms=now_ms
         promoted=False
+        self.head=head
         if m.samples>=400 and m.auc>=0.55:
             info=self.registry.save("model_b_head", head, {"auc":m.auc,"pr_auc":m.pr_auc,"acc":m.acc,"samples":m.samples})
             self.registry.promote(info)
-            self.head=head
             promoted=True
         self.last_retrain_reason = "trained"
         return m, promoted

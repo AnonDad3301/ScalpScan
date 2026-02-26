@@ -82,6 +82,7 @@ class Engine:
             vol_threshold=float(mod_cfg.get('regime_volatility_threshold', 0.004)),
             trend_threshold=float(mod_cfg.get('regime_trend_threshold', 0.25)),
         )
+        self._open_feature_bank: Dict[str, np.ndarray] = {}
 
 
     def sync_symbols(self) -> int:
@@ -304,6 +305,8 @@ class Engine:
 
                 if gate.get("decision")=="PASS" and direction in ("LONG","SHORT") and sym not in self.portfolio.positions:
                     res=self.portfolio.open(now_ms(), sym, direction, last_close, feats["atr"])
+                    if res.get("result") == "OK":
+                        self._open_feature_bank[sym] = np.asarray(x_last, dtype=float)
                     self.es.append(mk_event(env,"TRADE_OPEN","INFO",res))
 
             except Exception as e:
@@ -360,6 +363,11 @@ class Engine:
                 self.es.append(mk_event(base, "MODEL_RETRAIN", "INFO", payload))
         except Exception as e:
             self.es.append(mk_event(base, "ERROR", "ERROR", {"where": "MODEL_RETRAIN", "err": str(e)}))
+        try:
+            if not did:
+                self.es.append(mk_event(base, "MODEL_RETRAIN_SKIPPED", "INFO", {"samples": m_before.get("samples", 0), "auc": m_before.get("auc", 0.0)}))
+        except Exception:
+            pass
 
         # merge fresh prices for ALL open positions
         try:
@@ -379,6 +387,13 @@ class Engine:
             for c in closed:
                 self.es.append(mk_event(base, "TRADE_CLOSED", "INFO", c))
                 try:
+                    sym = str(c.get("symbol", ""))
+                    x = self._open_feature_bank.pop(sym, None)
+                    pnl = float(c.get("pnl", 0.0) or 0.0)
+                    y = 1 if pnl > 0 else (-1 if pnl < 0 else 0)
+                    if x is not None and y != 0:
+                        added_trade = self.trainer.add_samples(np.asarray([x], dtype=float), np.asarray([y], dtype=int))
+                        self.es.append(mk_event(base, "MODEL_TRADE_SAMPLE", "INFO", {"symbol": sym, "label": y, "pnl": pnl, "added": int(added_trade)}))
                     self.trainer.on_trade_closed(c)
                 except Exception:
                     pass

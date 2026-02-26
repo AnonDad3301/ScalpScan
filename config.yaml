@@ -111,3 +111,6 @@ notifications:
     send_signal: true
     send_trade_open: true
     send_trade_closed: true
+
+ui:
+  theme: dark_green
