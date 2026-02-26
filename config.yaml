@@ -102,3 +102,12 @@ modernization:
   forecast_mc_samples: 64
   regime_volatility_threshold: 0.004
   regime_trend_threshold: 0.25
+
+notifications:
+  telegram:
+    enabled: false
+    bot_token: ""
+    chat_id: ""
+    send_signal: true
+    send_trade_open: true
+    send_trade_closed: true

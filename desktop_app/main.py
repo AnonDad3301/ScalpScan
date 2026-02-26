@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio, csv, json, os, sys, time
+import yaml
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -105,13 +106,17 @@ class Table(QtWidgets.QTableWidget):
     def __init__(self, headers: List[str]):
         super().__init__(0, len(headers))
         self.setHorizontalHeaderLabels(headers)
-        self.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
+        self.horizontalHeader().setStretchLastSection(True)
         self.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.setAlternatingRowColors(True)
         self.verticalHeader().setVisible(False)
+        self.setWordWrap(False)
+        self.setSortingEnabled(True)
 
     def set_rows(self, rows: List[List[Any]]):
+        self.setSortingEnabled(False)
         self.setRowCount(len(rows))
         for r, row in enumerate(rows):
             for c, val in enumerate(row):
@@ -121,6 +126,8 @@ class Table(QtWidgets.QTableWidget):
                 else:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.setItem(r, c, item)
+        self.resizeColumnsToContents()
+        self.setSortingEnabled(True)
 
 SimpleTable = Table
 
@@ -171,6 +178,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tab_mlops()
         self._tab_levels()
         self._tab_performance()
+        self._tab_settings()
         self._tab_logs()
 
         # WS (commands only)
@@ -200,6 +208,18 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         super().closeEvent(e)
+
+    def _set_header_tips(self, table: QtWidgets.QTableWidget, tips: Dict[str, str]):
+        try:
+            for i in range(table.columnCount()):
+                h = table.horizontalHeaderItem(i)
+                if not h:
+                    continue
+                t = tips.get(h.text())
+                if t:
+                    h.setToolTip(t)
+        except Exception:
+            pass
 
     # Tabs
     def _tab_preflight(self):
@@ -248,6 +268,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _tab_scanner(self):
         w=QtWidgets.QWidget(); lay=QtWidgets.QVBoxLayout(w)
         self.tbl_signals=Table(["Время","Символ","Направление","Pred","Conf","Gate","Причины"])
+        self._set_header_tips(self.tbl_signals, {
+            "Pred": "Предсказанное направление/сила сигнала моделью.",
+            "Conf": "Уверенность модели в сигнале (0..1).",
+            "Gate": "Итог фильтра качества (PASS/FAIL).",
+        })
         lay.addWidget(self.tbl_signals)
         self.tabs.addTab(w,"Сканер")
 
@@ -261,6 +286,10 @@ class MainWindow(QtWidgets.QMainWindow):
         for i,lab in enumerate([self.m_samples,self.m_auc,self.m_acc,self.m_ver]):
             lab.setStyleSheet("font-size:16px; font-weight:600;"); grid.addWidget(lab,0,i)
         self.tbl_model=Table(["Время","Символ","Pred","Conf","AUC","Samples"])
+        self._set_header_tips(self.tbl_model, {
+            "AUC": "Качество классификации (чем ближе к 1, тем лучше).",
+            "Samples": "Количество обучающих примеров.",
+        })
         lay.addWidget(self.tbl_model)
         self.tabs.addTab(w,"Модель/Обучение")
 
@@ -303,6 +332,85 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tbl_prob=SimpleTable(["Время","Символ","P(up 3m)","P(up 5m)","ret_3m","ret_5m","breakout_strength"])
         lay.addWidget(self.tbl_prob)
         self.tabs.addTab(w, "Эффективность")
+
+    def _tab_settings(self):
+        w=QWidget(); lay=QVBoxLayout(w)
+        info=QLabel("Настройки из панели: можно менять фильтры гейта и Telegram-уведомления. Поля на английском, пояснения — на русском.")
+        info.setWordWrap(True); lay.addWidget(info)
+
+        form = QtWidgets.QFormLayout()
+        self.ed_conf = QtWidgets.QDoubleSpinBox(); self.ed_conf.setRange(0.0, 1.0); self.ed_conf.setSingleStep(0.01)
+        self.ed_rr = QtWidgets.QDoubleSpinBox(); self.ed_rr.setRange(0.0, 10.0); self.ed_rr.setSingleStep(0.1)
+        self.ed_unc = QtWidgets.QDoubleSpinBox(); self.ed_unc.setRange(0.0, 1.0); self.ed_unc.setSingleStep(0.005)
+        self.ed_auc_over = QtWidgets.QDoubleSpinBox(); self.ed_auc_over.setRange(0.0, 1.0); self.ed_auc_over.setSingleStep(0.01)
+        self.ed_tg_enabled = QtWidgets.QCheckBox("Telegram enabled")
+        self.ed_tg_token = QtWidgets.QLineEdit()
+        self.ed_tg_chat = QtWidgets.QLineEdit()
+
+        form.addRow("confidence_min (мин. уверенность)", self.ed_conf)
+        form.addRow("rr_min (мин. RR)", self.ed_rr)
+        form.addRow("uncertainty_max (макс. неопределенность)", self.ed_unc)
+        form.addRow("auc_override_confidence_min", self.ed_auc_over)
+        form.addRow("telegram.enabled", self.ed_tg_enabled)
+        form.addRow("telegram.bot_token", self.ed_tg_token)
+        form.addRow("telegram.chat_id", self.ed_tg_chat)
+        lay.addLayout(form)
+
+        row=QHBoxLayout()
+        b_load=QPushButton("Загрузить из config")
+        b_save=QPushButton("Сохранить config")
+        b_test=QPushButton("Тест Telegram")
+        b_load.clicked.connect(self._settings_load)
+        b_save.clicked.connect(self._settings_save)
+        b_test.clicked.connect(lambda: write_cmd(self.cfg, "send_test_telegram"))
+        row.addWidget(b_load); row.addWidget(b_save); row.addWidget(b_test); row.addStretch(1)
+        lay.addLayout(row)
+
+        self.lbl_settings = QLabel("Статус: —")
+        lay.addWidget(self.lbl_settings)
+        self.tabs.addTab(w, "Настройки")
+        self._settings_load()
+
+    def _settings_load(self):
+        try:
+            c = Config.load(str(self.cfg_path)).raw
+            gp = ((c.get("gate", {}) or {}).get("profiles", {}) or {}).get((c.get("gate", {}) or {}).get("profile", "scalp"), {})
+            self.ed_conf.setValue(float(gp.get("confidence_min", 0.52)))
+            self.ed_rr.setValue(float(gp.get("rr_min", 0.9)))
+            self.ed_unc.setValue(float(gp.get("uncertainty_max", 0.02)))
+            self.ed_auc_over.setValue(float((c.get("model", {}) or {}).get("auc_override_confidence_min", 0.70)))
+            tg = ((c.get("notifications", {}) or {}).get("telegram", {}) or {})
+            self.ed_tg_enabled.setChecked(bool(tg.get("enabled", False)))
+            self.ed_tg_token.setText(str(tg.get("bot_token", "")))
+            self.ed_tg_chat.setText(str(tg.get("chat_id", "")))
+            self.lbl_settings.setText("Статус: настройки загружены")
+        except Exception as e:
+            self.lbl_settings.setText(f"Статус: ошибка загрузки ({e})")
+
+    def _settings_save(self):
+        try:
+            with open(self.cfg_path, "r", encoding="utf-8") as f:
+                c = yaml.safe_load(f) or {}
+            gate = c.setdefault("gate", {})
+            prof_name = gate.get("profile", "scalp")
+            profiles = gate.setdefault("profiles", {})
+            gp = profiles.setdefault(prof_name, {})
+            gp["confidence_min"] = float(self.ed_conf.value())
+            gp["rr_min"] = float(self.ed_rr.value())
+            gp["uncertainty_max"] = float(self.ed_unc.value())
+            c.setdefault("model", {})["auc_override_confidence_min"] = float(self.ed_auc_over.value())
+            tg = c.setdefault("notifications", {}).setdefault("telegram", {})
+            tg["enabled"] = bool(self.ed_tg_enabled.isChecked())
+            tg["bot_token"] = self.ed_tg_token.text().strip()
+            tg["chat_id"] = self.ed_tg_chat.text().strip()
+            tg.setdefault("send_signal", True)
+            tg.setdefault("send_trade_open", True)
+            tg.setdefault("send_trade_closed", True)
+            with open(self.cfg_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(c, f, allow_unicode=True, sort_keys=False)
+            self.lbl_settings.setText("Статус: config сохранен. Перезапустите backend/hub.py")
+        except Exception as e:
+            self.lbl_settings.setText(f"Статус: ошибка сохранения ({e})")
 
     def _tab_logs(self):
         w=QtWidgets.QWidget(); lay=QtWidgets.QVBoxLayout(w)
@@ -559,6 +667,14 @@ class MainWindow(QtWidgets.QMainWindow):
         for b in (b1,b2,b3,b4): btns.addWidget(b)
         lay.addLayout(btns)
         self.tbl_modelb=SimpleTable(["Time","Symbol","Prob(head)","Prob(backbone)","wall_age","touches","dist_bps","Decision","thr","Status"])
+        self._set_header_tips(self.tbl_modelb, {
+            "Prob(head)": "Вероятность от обучаемой головы Model-B.",
+            "Prob(backbone)": "Вероятность от backbone (базовая).",
+            "wall_age": "Возраст сильной стенки стакана (сек).",
+            "touches": "Количество касаний стенки.",
+            "dist_bps": "Дистанция до стенки в bps.",
+            "thr": "Порог вероятности для PASS.",
+        })
         lay.addWidget(self.tbl_modelb)
         self.tabs.addTab(w, "Model-B")
 
@@ -579,6 +695,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pb_auc=QtWidgets.QProgressBar(); self.pb_auc.setRange(0,100); self.pb_auc.setValue(0); self.pb_auc.setFormat("AUC: %p%")
         lay.addWidget(self.pb_auc)
         self.tbl_mlops=SimpleTable(["Time","AUC","PR_AUC","ACC","Samples","Promoted"])
+        self._set_header_tips(self.tbl_mlops, {
+            "PR_AUC": "Метрика precision-recall (устойчива к дисбалансу классов).",
+            "ACC": "Точность классификации.",
+            "Promoted": "Новая версия модели принята в прод.",
+        })
         lay.addWidget(self.tbl_mlops)
         self.tabs.addTab(w, "MLOps")
 
@@ -601,4 +722,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

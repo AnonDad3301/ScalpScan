@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio, json, time, logging, datetime, faulthandler, uuid
+import urllib.parse, urllib.request
 from typing import Any, Dict, Set
 
 import websockets
@@ -33,6 +34,7 @@ logging.getLogger("websockets.http11").disabled = True
 
 clients: Set[Any] = set()
 STATE: Dict[str, Any] = {"running": False, "preflight_ok": False, "preflight_report": []}
+telegram_notifier = None
 
 tele: Telemetry | None = None
 
@@ -157,6 +159,70 @@ def append_event(es, rt: Dict[str, Any], stage: str, payload: Dict[str, Any], ru
         "level": level,
         "payload": payload,
     })
+    try:
+        if telegram_notifier is not None:
+            telegram_notifier.notify(stage=stage, payload=payload, symbol=symbol, timeframe=str(rt.get("timeframe", "")))
+    except Exception:
+        pass
+
+
+class TelegramNotifier:
+    def __init__(self, cfg: Dict[str, Any]):
+        tg = (cfg.get("notifications", {}) or {}).get("telegram", {}) or {}
+        self.enabled = bool(tg.get("enabled", False))
+        self.bot_token = str(tg.get("bot_token", "") or "")
+        self.chat_id = str(tg.get("chat_id", "") or "")
+        self.send_signal = bool(tg.get("send_signal", True))
+        self.send_trade_open = bool(tg.get("send_trade_open", True))
+        self.send_trade_closed = bool(tg.get("send_trade_closed", True))
+
+    def _should_send(self, stage: str) -> bool:
+        if not self.enabled or not self.bot_token or not self.chat_id:
+            return False
+        if stage == "SIGNAL":
+            return self.send_signal
+        if stage == "TRADE_OPEN":
+            return self.send_trade_open
+        if stage == "TRADE_CLOSED":
+            return self.send_trade_closed
+        return False
+
+    def notify(self, stage: str, payload: Dict[str, Any], symbol: str, timeframe: str) -> None:
+        if not self._should_send(stage):
+            return
+        text = self._format_message(stage, payload, symbol, timeframe)
+        if not text:
+            return
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        data = urllib.parse.urlencode({"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=4.0):
+            pass
+
+    def _format_message(self, stage: str, p: Dict[str, Any], symbol: str, timeframe: str) -> str:
+        if stage == "SIGNAL":
+            g = p.get("gate", {}) if isinstance(p.get("gate"), dict) else {}
+            return (
+                f"📡 <b>Сигнал</b> {symbol} ({timeframe})\n"
+                f"Направление: <b>{p.get('direction')}</b>\n"
+                f"Pred/Conf: {p.get('pred')} / {p.get('confidence')}\n"
+                f"Gate: {g.get('decision')} | Причины: {','.join(g.get('reasons', []) or [])}\n"
+                f"Entry: {p.get('entry')} | SL: {p.get('sl')} | TP1: {p.get('tp1')} | TP2: {p.get('tp2')}"
+            )
+        if stage == "TRADE_OPEN":
+            return (
+                f"🟢 <b>Позиция открыта</b> {symbol}\n"
+                f"Qty: {p.get('qty')} | Notional: {p.get('notional')}\n"
+                f"SL: {p.get('sl')} | TP1: {p.get('tp1')} | TP2: {p.get('tp2')}"
+            )
+        if stage == "TRADE_CLOSED":
+            return (
+                f"🔴 <b>Позиция закрыта</b> {symbol}\n"
+                f"Причина: {p.get('reason')}\n"
+                f"Entry: {p.get('entry')} | Exit: {p.get('exit')}\n"
+                f"PnL: <b>{p.get('pnl')}</b>"
+            )
+        return ""
 
 
 async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, tele, price_worker, ws_client, trades_store) -> None:
@@ -417,6 +483,18 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
                             elif c=="rollback_model_b":
                                 STATE["rollback_model_b"]=True
                                 append_event(es, rt, "CMD", {"cmd": c}, run_id="cmd", level="INFO")
+                            elif c=="send_test_telegram":
+                                append_event(es, rt, "SIGNAL", {
+                                    "direction": "LONG",
+                                    "pred": 0.77,
+                                    "confidence": 0.81,
+                                    "gate": {"decision": "PASS", "reasons": []},
+                                    "entry": 100.0,
+                                    "sl": 99.2,
+                                    "tp1": 100.8,
+                                    "tp2": 101.3,
+                                }, run_id="cmd", level="INFO", symbol="TEST/USDT")
+                                append_event(es, rt, "CMD", {"cmd": c, "status": "sent"}, run_id="cmd", level="INFO")
                         last_pos=f.tell()
             except Exception as e:
                 append_event(es, rt, "CMD_ERROR", {"err": str(e)}, run_id="cmd", level="ERROR")
@@ -449,6 +527,8 @@ async def main():
     _boot_log(f"{datetime.datetime.now().isoformat()} HUB_MAIN_ENTER")
 
     cfg = Config.load("config.yaml").raw
+    global telegram_notifier
+    telegram_notifier = TelegramNotifier(cfg)
     rt = cfg["runtime"]
     es = SQLiteEventStore(cfg["storage"]["events_db"])
     trades_store = TradesStore(cfg["storage"].get("trades_db","data/trades.sqlite"))
