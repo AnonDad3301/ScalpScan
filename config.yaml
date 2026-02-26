@@ -75,6 +75,8 @@ gate:
       latency_ms_max: 1200
       high_confidence_min: 0.62
       enforce_auc_min: false
+      enforce_directional_agreement: true
+      enforce_high_confidence: false
 execution:
   deposit_usd: 2000
   risk_usd: 50
@@ -105,6 +107,7 @@ storage:
   trades_db: data/trades.sqlite
 model_b:
   hf_id: ibm-research/patchtst-fm-r1
+  agreement_margin: 0.08
   cache_dir: data/hf_cache
   device: cpu
 pricing:

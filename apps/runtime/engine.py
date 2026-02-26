@@ -220,8 +220,11 @@ class Engine:
                 feats["latency_ms"] = float(getattr(self.market, "last_latency_ms", 0.0) or 0.0)
                 fees_bps = float(self.cfg.get("execution", {}).get("fees_bps", 0.0)) + float(self.cfg.get("execution", {}).get("slippage_bps", 0.0))
                 feats["costs_bps"] = fees_bps
-                feats["tp_return"] = float(abs((feats.get("tp1", last_close) - last_close) / max(1e-12, last_close))) if feats.get("tp1") is not None else 0.0
-                feats["sl_return"] = float(abs((last_close - feats.get("sl", last_close)) / max(1e-12, last_close))) if feats.get("sl") is not None else 0.0
+                base_risk = max(float(feats.get("atr", 0.0) or 0.0), float(last_close) * 0.0012)
+                sl_mult = float(ex_cfg.get("sl_atr_mult", 1.2) or 1.2)
+                tp2_mult = float(ex_cfg.get("tp2_atr_mult", 1.7) or 1.7)
+                feats["tp_return"] = float((tp2_mult * base_risk) / max(1e-12, last_close))
+                feats["sl_return"] = float((sl_mult * base_risk) / max(1e-12, last_close))
                 feats["sl_streak"] = float(self._sl_streak)
 
                 try:
@@ -332,7 +335,11 @@ class Engine:
                 mout["pred"] = (ens_d.get("p_up_3m", 0.5) - 0.5) * 2.0
                 mout["confidence"] = ens_d.get("confidence", mout.get("confidence", 0.5))
                 mout["model_a_direction"] = "LONG" if p_a_up3 >= 0.5 else "SHORT"
-                mout["model_b_direction"] = "LONG" if model_b_prob >= 0.5 else "SHORT"
+                b_margin = float(self.cfg.get("model_b", {}).get("agreement_margin", 0.08) or 0.08)
+                if abs(model_b_prob - 0.5) < b_margin:
+                    mout["model_b_direction"] = "NEUTRAL"
+                else:
+                    mout["model_b_direction"] = "LONG" if model_b_prob >= 0.5 else "SHORT"
 
                 gate=gate_decide(
                     feats, inv, mout, mhealth,

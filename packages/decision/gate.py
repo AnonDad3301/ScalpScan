@@ -20,6 +20,8 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
     latency_ms_max = float(prof.get("latency_ms_max", 1200.0))
     high_conf_min = float(prof.get("high_confidence_min", 0.7))
     enforce_auc_min = bool(prof.get("enforce_auc_min", False))
+    enforce_directional_agreement = bool(prof.get("enforce_directional_agreement", True))
+    enforce_high_confidence = bool(prof.get("enforce_high_confidence", False))
 
     rules = []
     reasons = []
@@ -98,7 +100,10 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
 
     model_a_direction = str(model_out.get("model_a_direction", ""))
     model_b_direction = str(model_out.get("model_b_direction", ""))
-    agree = bool(model_a_direction) and (model_a_direction == model_b_direction)
+    if (not enforce_directional_agreement) or (model_b_direction in ("", "NEUTRAL")):
+        agree = True
+    else:
+        agree = bool(model_a_direction) and (model_a_direction == model_b_direction)
     add("DIRECTIONAL_AGREEMENT", agree, f"{model_a_direction}/{model_b_direction}", "same")
 
     costs = float(features.get("costs_bps", 0.0)) / 10000.0
@@ -112,7 +117,7 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
     add("COOLDOWN_AFTER_SL", sl_streak < cooldown_after_sl, sl_streak, cooldown_after_sl)
 
     high_conf = float(model_out.get("confidence", 0.0)) >= high_conf_min
-    add("HIGH_CONFIDENCE", high_conf, float(model_out.get("confidence", 0.0)), high_conf_min)
+    add("HIGH_CONFIDENCE", (high_conf or (not enforce_high_confidence)), float(model_out.get("confidence", 0.0)), high_conf_min, note="optional" if not enforce_high_confidence else None)
 
     decision = "PASS" if all(r["pass"] for r in rules) else "FAIL"
     return {

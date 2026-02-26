@@ -137,6 +137,29 @@ class SignalFeatureGateTests(unittest.TestCase):
         self.assertEqual(out["decision"], "FAIL")
         self.assertIn("SPREAD_RANK_MAX", out["reasons"])
 
+    def test_gate_allows_neutral_model_b_direction(self):
+        features = {
+            "adx": 30, "spread_bps": 5, "spread_pct_rank": 0.2, "latency_ms": 100,
+            "volz": 0.4, "forecast_uncertainty": 0.003, "rr_ratio": 1.4, "trend_strength": 0.3,
+            "regime": "trend", "tp_return": 0.012, "sl_return": 0.006, "costs_bps": 3.0, "sl_streak": 0,
+        }
+        out = decide(
+            features,
+            inv_results=[{"pass": True}],
+            model_out={"confidence": 0.6, "pred": 0.2, "p_tp_first": 0.62, "model_a_direction": "LONG", "model_b_direction": "NEUTRAL"},
+            model_health={"samples": 900, "auc": 0.45},
+            cfg={
+                "profile": "scalp",
+                "profiles": {"scalp": {
+                    "entry_threshold": 0.06, "confidence_min": 0.52, "adx_min": 8, "spread_max": 20,
+                    "volz_max": 3.5, "uncertainty_max": 0.02, "rr_min": 0.9, "trend_strength_min": 0.05,
+                    "enforce_auc_min": False, "enforce_directional_agreement": True, "enforce_high_confidence": False,
+                }},
+                "min_samples": 50, "auc_warmup_samples": 600, "min_auc": 0.52,
+            },
+        )
+        self.assertEqual(out["decision"], "PASS")
+
 
 if __name__ == "__main__":
     unittest.main()
