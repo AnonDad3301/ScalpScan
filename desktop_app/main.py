@@ -367,8 +367,11 @@ class MainWindow(QtWidgets.QMainWindow):
                              f"{float(p.get('sl',0.0)):.6f}",f"{float(p.get('tp1',0.0)):.6f}",f"{float(p.get('tp2',0.0)):.6f}"])
         self.tbl_positions.set_rows(pos_rows)
 
-        # signals/model/trace
+        # signals/model/trace + Model-B/MLOps/Levels/Dataset
         sig_rows=[]; model_rows=[]; trace_rows=[]
+        modelb_rows=[]; mlops_rows=[]; levels_rows=[]
+        modelb_status=None
+        dataset_rows=None
         for e in self.events[-1400:]:
             ts=fmt_ts(e.get("ts")); sym=e.get("symbol"); stg=e.get("stage"); lvl=e.get("level"); payload=e.get("payload",{})
             if stg=="SIGNAL":
@@ -377,10 +380,57 @@ class MainWindow(QtWidgets.QMainWindow):
             if stg=="MODEL_INFERRED":
                 mh=(payload.get("metrics") or {})
                 model_rows.append([ts,sym,payload.get("pred"),payload.get("confidence"),mh.get("auc"),mh.get("samples")])
+            if stg=="MODEL_B_INFERRED":
+                modelb_rows.append([
+                    ts, sym, payload.get("prob_head"), payload.get("prob_backbone"),
+                    payload.get("wall_age"), payload.get("wall_touches"), payload.get("wall_dist_bps"),
+                    payload.get("decision"), payload.get("thr"), payload.get("status", "OK")
+                ])
+                levels_rows.append([
+                    ts, sym, payload.get("imb", 0.0), payload.get("spread_bps", 0.0),
+                    payload.get("wall_age", 0.0), payload.get("wall_touches", 0), payload.get("wall_dist_bps", 0.0)
+                ])
+            if stg=="MODEL_B_STATUS":
+                modelb_status=payload
+                dataset_rows=payload.get("dataset_rows", dataset_rows)
+            if stg=="MODEL_B_DATASET_APPEND":
+                dataset_rows=payload.get("rows", dataset_rows)
+            if stg in ("MODEL_B_RETRAIN", "MODEL_B_RETRAIN_SKIPPED"):
+                mlops_rows.append([
+                    ts,
+                    payload.get("auc", "—"),
+                    payload.get("pr_auc", "—"),
+                    payload.get("acc", "—"),
+                    payload.get("samples", payload.get("rows", "—")),
+                    payload.get("promoted", False) if stg=="MODEL_B_RETRAIN" else "SKIPPED"
+                ])
             trace_rows.append([ts,str(e.get("run_id",""))[:8],sym,stg,lvl,json.dumps(payload,ensure_ascii=False)[:800]])
         self.tbl_signals.set_rows(sig_rows[-350:])
         self.tbl_model.set_rows(model_rows[-350:])
         self.tbl_trace.set_rows(trace_rows[-500:])
+        self.tbl_modelb.set_rows(modelb_rows[-350:])
+        self.tbl_mlops.set_rows(mlops_rows[-350:])
+        self.tbl_levels.set_rows(levels_rows[-350:])
+
+        if modelb_status:
+            self.lbl_modelb.setText(
+                f"Model-B: rows={int(modelb_status.get('dataset_rows',0))} | pending={int(modelb_status.get('pending',0))} | "
+                f"auc={float(modelb_status.get('auc',0.0)):.3f} | acc={float(modelb_status.get('acc',0.0)):.3f}"
+            )
+            self.lbl_mlops.setText(
+                f"MLOps: dataset_rows={int(modelb_status.get('dataset_rows',0))}, training_disabled={bool(modelb_status.get('training_disabled',False))}"
+            )
+        else:
+            self.lbl_modelb.setText("Model-B: нет событий MODEL_B_STATUS / MODEL_B_INFERRED")
+
+        ds_path = ""
+        for e in reversed(self.events[-2000:]):
+            if e.get("stage") == "MODEL_B_STATUS":
+                ds_path = str((e.get("payload") or {}).get("dataset_path", ""))
+                break
+        rows_val = int(dataset_rows or 0)
+        self.lbl_ds.setText(f"Dataset: {rows_val} rows")
+        self.tbl_ds.set_rows([[rows_val, "—", fmt_ts(self.events[-1].get("ts") if self.events else 0), ds_path]])
 
         mh=self.model_health or {}
         self.m_samples.setText(f"Samples: {int(mh.get('samples',0))}")
@@ -416,7 +466,7 @@ class MainWindow(QtWidgets.QMainWindow):
             buf.append('')
 
         for e in self.events[-500:]:
-            if e.get("stage") in ("PRICE_TICK","ERROR","TRADE_OPEN","TRADE_CLOSED"):
+            if e.get("stage") in ("PRICE_TICK","ERROR","TRADE_OPEN","TRADE_CLOSED","MODEL_B_STATUS","MODEL_B_RETRAIN","MODEL_B_RETRAIN_SKIPPED","POSITION_UPDATE"):
                 buf.append(f"{fmt_ts(e.get('ts'))} {e.get('stage')} {e.get('symbol')} {json.dumps(e.get('payload',{}), ensure_ascii=False)[:500]}")
         self.txt_mon.setPlainText("\n".join(buf[-250:]) if buf else "Пока нет событий. Запусти hub и нажми Старт сканера.")
 
@@ -483,5 +533,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
