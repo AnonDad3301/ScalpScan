@@ -290,7 +290,7 @@ class Engine:
 
             st=self.ds_builder.stats()
 
-            self.es.append(mk_event({"run_id":run_id,"service":"sf-runtime","exchange":self.exchange,"market":self.market,"timeframe":self.timeframe,"symbol":"*"},
+            self.es.append(mk_event(base,
 
                                     "MODEL_B_STATUS","INFO",{"dataset_rows": st.get("rows",0), "dataset_path": st.get("path",""), "price_source": price_source}))
 
@@ -315,19 +315,19 @@ class Engine:
 
                 if mtr is not None:
 
-                    self.es.append(mk_event({"run_id":run_id,"service":"sf-runtime","exchange":self.exchange,"market":self.market,"timeframe":self.timeframe,"symbol":"*"},
+                    self.es.append(mk_event(base,
 
                                             "MODEL_B_RETRAIN","INFO",{"auc":mtr.auc,"pr_auc":mtr.pr_auc,"acc":mtr.acc,"samples":mtr.samples,"promoted":bool(prom)}))
 
                     if prom:
 
-                        self.es.append(mk_event({"run_id":run_id,"service":"sf-runtime","exchange":self.exchange,"market":self.market,"timeframe":self.timeframe,"symbol":"*"},
+                        self.es.append(mk_event(base,
 
                                                 "MODEL_B_PROMOTED","INFO",{"samples":mtr.samples,"auc":mtr.auc}))
 
         except Exception as e:
 
-            self.es.append(mk_event({"run_id":run_id,"service":"sf-runtime","exchange":self.exchange,"market":self.market,"timeframe":self.timeframe,"symbol":"*"},
+            self.es.append(mk_event(base,
 
                                     "ERROR","ERROR",{"where":"MODEL_B_RETRAIN","err":str(e)}))
 
@@ -346,13 +346,13 @@ class Engine:
 
             diff=calc-equity
 
-            self.es.append(mk_event({"run_id":run_id,"service":"sf-runtime","exchange":self.exchange,"market":self.market,"timeframe":self.timeframe,"symbol":"*"},
+            self.es.append(mk_event(base,
 
                                     "ACCOUNT","INFO",{"cash":cash,"upnl":upnl,"equity":equity,"equity_calc":calc,"diff":diff,"price_source": price_source}))
 
             if abs(diff) > max(1e-6, abs(equity)*1e-4):
 
-                self.es.append(mk_event({"run_id":run_id,"service":"sf-runtime","exchange":self.exchange,"market":self.market,"timeframe":self.timeframe,"symbol":"*"},
+                self.es.append(mk_event(base,
 
                                         "ACCOUNT_MISMATCH","ERROR",{"cash":cash,"upnl":upnl,"equity":equity,"equity_calc":calc,"diff":diff}))
 
