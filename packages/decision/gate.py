@@ -19,6 +19,7 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
     spread_rank_max = float(prof.get("spread_rank_max", 0.95))
     latency_ms_max = float(prof.get("latency_ms_max", 1200.0))
     high_conf_min = float(prof.get("high_confidence_min", 0.7))
+    enforce_auc_min = bool(prof.get("enforce_auc_min", False))
 
     rules = []
     reasons = []
@@ -45,6 +46,8 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
         auc_ok = auc >= min_auc
         if not auc_ok and conf >= auc_override_conf:
             add("MODEL_AUC_MIN", True, auc, min_auc, note=f"override by confidence>={auc_override_conf}")
+        elif not auc_ok and not enforce_auc_min:
+            add("MODEL_AUC_MIN", True, auc, min_auc, note="soft-check: enforce_auc_min=false")
         else:
             add("MODEL_AUC_MIN", auc_ok, auc, min_auc)
 

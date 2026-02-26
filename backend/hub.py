@@ -283,7 +283,15 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
     async def price_loop():
         while True:
             t0 = time.time()
-            syms = list(getattr(eng.portfolio, "positions", {}).keys())
+            open_syms = list(getattr(eng.portfolio, "positions", {}).keys())
+            if STATE.get("running", False):
+                try:
+                    uni_syms = list(eng.universe())
+                except Exception:
+                    uni_syms = []
+            else:
+                uni_syms = []
+            syms = list(dict.fromkeys(open_syms + uni_syms))[: int(rt.get("max_pairs", 50) or 50)]
             ws_connected=False; ws_stale_ms=None; ws_ticker_1s=None; ws_sub_ok=None; ws_sub_err=None
             try:
                 _, st = await ws_client.get_prices()
@@ -414,17 +422,17 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
                 append_event(es, rt, "POSITIONS_SNAPSHOT", pos_payload, run_id="price")
             except asyncio.TimeoutError:
                 status = "TIMEOUT"
-                append_event(es, rt, "PRICE_TIMEOUT", {"timeout_sec": price_timeout, "open_positions": len(syms)}, run_id="price", level="ERROR")
+                append_event(es, rt, "PRICE_TIMEOUT", {"timeout_sec": price_timeout, "open_positions": len(open_syms), "tracked_symbols": len(syms)}, run_id="price", level="ERROR")
             except Exception as e:
                 status = "ERROR"
                 append_event(es, rt, "PRICE_ERROR", {"err": str(e)}, run_id="price", level="ERROR")
 
             dt_ms = int((time.time()-t0)*1000)
             liveness["price"] = time.monotonic()
-            append_event(es, rt, "PRICE_TICK", {"open_positions": len(syms), "prices_n": len(prices), "dt_ms": dt_ms, "status": status, "symbols": syms[:50], "ws_connected": ws_connected, "ws_stale_ms": ws_stale_ms, "ws_ticker_1s": ws_ticker_1s, "ws_sub_ok": ws_sub_ok, "ws_sub_err": ws_sub_err}, run_id="price")
+            append_event(es, rt, "PRICE_TICK", {"open_positions": len(open_syms), "tracked_symbols": len(syms), "prices_n": len(prices), "dt_ms": dt_ms, "status": status, "symbols": syms[:50], "ws_connected": ws_connected, "ws_stale_ms": ws_stale_ms, "ws_ticker_1s": ws_ticker_1s, "ws_sub_ok": ws_sub_ok, "ws_sub_err": ws_sub_err}, run_id="price")
 
             try:
-                sp = tele.span_start("PRICE_TICK", trace_id="price_tick", symbol="*", open_positions=len(syms))
+                sp = tele.span_start("PRICE_TICK", trace_id="price_tick", symbol="*", open_positions=len(open_syms), tracked_symbols=len(syms))
                 tele.span_end(sp, status=status, prices_n=len(prices), dt_ms=dt_ms)
             except Exception:
                 pass

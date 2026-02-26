@@ -268,16 +268,6 @@ class Engine:
                     "metrics":mhealth,"samples_added":added
                 }))
 
-                gate=gate_decide(
-                    feats, inv, mout, mhealth,
-                    {"profile":self.cfg["gate"]["profile"],"profiles":self.cfg["gate"]["profiles"],
-                     "min_auc":float(self.cfg["model"].get("min_auc",0.52)),
-                     "min_samples":int(self.cfg["model"].get("min_samples",300)),
-                     "auc_warmup_samples":int(self.cfg["model"].get("auc_warmup_samples",600))}
-                )
-                self.es.append(mk_event(env,"GATE_DECISION","INFO",gate))
-
-
                 # Model-B shadow inference + dataset shadow label
                 try:
                     closes = np.array([row[4] for row in ohlcv], dtype=float) if ohlcv else np.array([], dtype=float)
@@ -343,6 +333,16 @@ class Engine:
                 mout["confidence"] = ens_d.get("confidence", mout.get("confidence", 0.5))
                 mout["model_a_direction"] = "LONG" if p_a_up3 >= 0.5 else "SHORT"
                 mout["model_b_direction"] = "LONG" if model_b_prob >= 0.5 else "SHORT"
+
+                gate=gate_decide(
+                    feats, inv, mout, mhealth,
+                    {"profile":self.cfg["gate"]["profile"],"profiles":self.cfg["gate"]["profiles"],
+                     "min_auc":float(self.cfg["model"].get("min_auc",0.52)),
+                     "min_samples":int(self.cfg["model"].get("min_samples",300)),
+                     "auc_warmup_samples":int(self.cfg["model"].get("auc_warmup_samples",600)),
+                     "auc_override_confidence_min": float(self.cfg["model"].get("auc_override_confidence_min",0.70))}
+                )
+                self.es.append(mk_event(env,"GATE_DECISION","INFO",gate))
 
                 direction = str(ens_d.get("direction", "NEUTRAL"))
                 if ens_d.get("no_trade_reason"):

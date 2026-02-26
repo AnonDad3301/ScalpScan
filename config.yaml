@@ -73,7 +73,8 @@ gate:
       cooldown_after_sl: 3
       spread_rank_max: 0.95
       latency_ms_max: 1200
-      high_confidence_min: 0.70
+      high_confidence_min: 0.62
+      enforce_auc_min: false
 execution:
   deposit_usd: 2000
   risk_usd: 50
