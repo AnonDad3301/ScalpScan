@@ -11,7 +11,7 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
     spread_max = float(prof.get("spread_max", 12.0))
     volz_max = float(prof.get("volz_max", 3.5))
     uncertainty_max = float(prof.get("uncertainty_max", 0.02))
-    rr_min = float(prof.get("rr_min", 1.2))
+    rr_min = float(prof.get("rr_min", 0.9))
     trend_strength_min = float(prof.get("trend_strength_min", 0.05))
 
     rules = []
@@ -31,12 +31,17 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
     auc = float(model_health.get("auc", 0.0))
     warmup = int(cfg.get("auc_warmup_samples", 600))
     min_auc = float(cfg.get("min_auc", 0.52))
+    conf = float(model_out.get("confidence", 0.5))
+    auc_override_conf = float(cfg.get("auc_override_confidence_min", 0.70))
     if samples < warmup:
         add("MODEL_AUC_WARMUP", True, auc, f"warmup<{warmup}", note="AUC check skipped during warmup")
     else:
-        add("MODEL_AUC_MIN", auc >= min_auc, auc, min_auc)
+        auc_ok = auc >= min_auc
+        if not auc_ok and conf >= auc_override_conf:
+            add("MODEL_AUC_MIN", True, auc, min_auc, note=f"override by confidence>={auc_override_conf}")
+        else:
+            add("MODEL_AUC_MIN", auc_ok, auc, min_auc)
 
-    conf = float(model_out.get("confidence", 0.5))
     add("CONFIDENCE_MIN", conf >= conf_min, conf, conf_min)
 
     pred = float(model_out.get("pred", 0.0))

@@ -63,6 +63,42 @@ class SignalFeatureGateTests(unittest.TestCase):
         self.assertIn("forecast_uncertainty", out)
         self.assertIn("rr_ratio", out)
 
+    def test_gate_auc_override_by_high_confidence(self):
+        features = {
+            "adx": 20,
+            "spread_bps": 5,
+            "volz": 0.5,
+            "forecast_uncertainty": 0.005,
+            "rr_ratio": 1.1,
+            "trend_strength": 0.2,
+        }
+        out = decide(
+            features,
+            inv_results=[{"pass": True}],
+            model_out={"confidence": 0.75, "pred": 0.2},
+            model_health={"samples": 800, "auc": 0.45},
+            cfg={
+                "profile": "scalp",
+                "profiles": {
+                    "scalp": {
+                        "entry_threshold": 0.06,
+                        "confidence_min": 0.52,
+                        "adx_min": 8,
+                        "spread_max": 20,
+                        "volz_max": 3.5,
+                        "uncertainty_max": 0.02,
+                        "rr_min": 0.9,
+                        "trend_strength_min": 0.05,
+                    }
+                },
+                "min_samples": 50,
+                "auc_warmup_samples": 600,
+                "min_auc": 0.52,
+                "auc_override_confidence_min": 0.70,
+            },
+        )
+        self.assertEqual(out["decision"], "PASS")
+
 
 if __name__ == "__main__":
     unittest.main()

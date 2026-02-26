@@ -174,6 +174,12 @@ class Engine:
                 forecast_ret = float(f1.get("ret", 0.0) or 0.0)
                 forecast_unc = float(f1.get("uncertainty", 1.0) or 1.0)
                 rr_ratio = abs(float(pattern.breakout_strength)) / max(1e-9, float(feats.get("atr", 0.0))) if hasattr(pattern, 'breakout_strength') else 0.0
+                ex_cfg = ((self.cfg.get("execution", {}) or {}).get("exits", {}) or {})
+                sl_mult = float(ex_cfg.get("sl_atr_mult", 1.2) or 1.2)
+                tp1_mult = float(ex_cfg.get("tp1_atr_mult", 1.1) or 1.1)
+                tp2_mult = float(ex_cfg.get("tp2_atr_mult", 1.7) or 1.7)
+                rr_from_levels = max(tp1_mult, tp2_mult) / max(1e-9, sl_mult)
+                rr_ratio = max(float(rr_ratio), float(rr_from_levels))
                 trend_strength = abs(float(feats.get("adx", 0.0))) / 100.0
                 feats["forecast_uncertainty"] = forecast_unc
                 feats["forecast_ret"] = forecast_ret
