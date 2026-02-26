@@ -152,6 +152,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.positions: Dict[str, Any] = {}
         self.account: Dict[str, Any] = {"deposit": None, "cash": None, "equity": None, "open_positions": None}
         self.model_health: Dict[str, Any] = {}
+        self.trade_outcome_stats: Dict[str, Any] = {}
 
         # UI
         self.tabs = QtWidgets.QTabWidget()
@@ -169,6 +170,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tab_dataset()
         self._tab_mlops()
         self._tab_levels()
+        self._tab_performance()
         self._tab_logs()
 
         # WS (commands only)
@@ -292,6 +294,16 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(btn)
         self.tabs.addTab(w,"Мониторинг")
 
+    def _tab_performance(self):
+        w=QWidget(); lay=QVBoxLayout(w)
+        info=QLabel("Эффективность: статистика исходов сделок + вероятности движения 3/5 минут до уровней.")
+        info.setWordWrap(True); lay.addWidget(info)
+        self.lbl_perf=QLabel("Сделки: пока нет данных")
+        lay.addWidget(self.lbl_perf)
+        self.tbl_prob=SimpleTable(["Время","Символ","P(up 3m)","P(up 5m)","ret_3m","ret_5m","breakout_strength"])
+        lay.addWidget(self.tbl_prob)
+        self.tabs.addTab(w, "Эффективность")
+
     def _tab_logs(self):
         w=QtWidgets.QWidget(); lay=QtWidgets.QVBoxLayout(w)
         row=QtWidgets.QHBoxLayout(); lay.addLayout(row)
@@ -344,6 +356,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 mh = (e.get("payload", {}).get("metrics") or {})
                 if mh:
                     self.model_health = mh
+                break
+        for e in tail:
+            if e.get("stage") == "TRADE_OUTCOME_STATS":
+                self.trade_outcome_stats = (e.get("payload") or {})
                 break
 
     def refresh_ui(self):
@@ -463,6 +479,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.tbl_syms.set_rows([[i+1, s] for i,s in enumerate(self.symbols[:4000])])
 
+
+        st = self.trade_outcome_stats or {}
+        total_closed = int(st.get("total_closed", 0) or 0)
+        wins = int(st.get("wins", 0) or 0)
+        sl = int(st.get("sl", 0) or 0)
+        be = int(st.get("breakeven", 0) or 0)
+        loss = int(st.get("loss", 0) or 0)
+        win_rate = float(st.get("win_rate", 0.0) or 0.0)
+        self.lbl_perf.setText(f"Сделки: total={total_closed}, wins={wins}, loss={loss}, SL={sl}, BE={be}, win_rate={win_rate:.1%}")
+
+        prob_rows=[]
+        for e in self.events[-1500:]:
+            if e.get("stage") == "SHORT_TERM_LEVEL_PROB":
+                p=e.get("payload",{})
+                prob_rows.append([fmt_ts(e.get("ts")), e.get("symbol"), f"{float(p.get('p_up_3m',0.0)):.2%}", f"{float(p.get('p_up_5m',0.0)):.2%}", f"{float(p.get('ret_3m',0.0)):.4f}", f"{float(p.get('ret_5m',0.0)):.4f}", f"{float(p.get('breakout_strength',0.0)):.4f}"])
+        self.tbl_prob.set_rows(prob_rows[-250:])
+
         # closed trades
         closed_rows=[]
         for e in self.events[-4000:]:
@@ -489,7 +522,7 @@ class MainWindow(QtWidgets.QMainWindow):
             buf.append('')
 
         for e in self.events[-500:]:
-            if e.get("stage") in ("PRICE_TICK","ERROR","TRADE_OPEN","TRADE_CLOSED","MODEL_B_STATUS","MODEL_B_RETRAIN","MODEL_B_RETRAIN_SKIPPED","POSITION_UPDATE"):
+            if e.get("stage") in ("PRICE_TICK","ERROR","TRADE_OPEN","TRADE_CLOSED","MODEL_B_STATUS","MODEL_B_RETRAIN","MODEL_B_RETRAIN_SKIPPED","POSITION_UPDATE","TRADE_OUTCOME_STATS","SHORT_TERM_LEVEL_PROB"):
                 buf.append(f"{fmt_ts(e.get('ts'))} {e.get('stage')} {e.get('symbol')} {json.dumps(e.get('payload',{}), ensure_ascii=False)[:500]}")
         self.txt_mon.setPlainText("\n".join(buf[-250:]) if buf else "Пока нет событий. Запусти hub и нажми Старт сканера.")
 

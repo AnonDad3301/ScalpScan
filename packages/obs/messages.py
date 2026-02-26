@@ -16,6 +16,8 @@ CATALOG: Dict[str, Tuple[str, str]] = {
     "EXIT_ACTION": ("Действие выхода", "Exit action"),
     "TRADE_CLOSED": ("Сделка закрыта", "Trade closed"),
     "ACCOUNT": ("Снимок счёта", "Account snapshot"),
+    "SHORT_TERM_LEVEL_PROB": ("Вероятности 3-5м по уровню", "3-5m level probabilities"),
+    "TRADE_OUTCOME_STATS": ("Статистика исходов сделок", "Trade outcome stats"),
     "ACCOUNT_MISMATCH": ("Несоответствие учёта", "Accounting mismatch"),
     "MODEL_B_LOAD_START": ("Model-B: загрузка начата", "Model-B: load started"),
     "MODEL_B_LOAD_END": ("Model-B: загрузка завершена", "Model-B: load finished"),

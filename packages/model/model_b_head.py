@@ -40,6 +40,7 @@ class ModelBHead:
         if not self.fitted:
             return np.full((len(X),), 0.5, dtype=float)
         z=self.clf.decision_function(X)
+        z=np.clip(z, -60.0, 60.0)
         return 1.0/(1.0+np.exp(-z))
 
     def infer_one(self, feats: Dict[str,Any]) -> float:

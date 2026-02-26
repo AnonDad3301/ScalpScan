@@ -168,6 +168,19 @@ class Engine:
                 self.es.append(mk_event(env, "MARKET_PATTERN_SCAN", "INFO", pattern.as_dict()))
                 self.es.append(mk_event(env, "REGIME_DETECTED", "INFO", regime.as_dict()))
                 self.es.append(mk_event(env, "MULTI_HORIZON_FORECAST", "INFO", {"forecast": forecast}))
+                f3 = forecast.get("m3", {}) if isinstance(forecast, dict) else {}
+                f5 = forecast.get("m5", {}) if isinstance(forecast, dict) else {}
+                p3 = 1.0 / (1.0 + np.exp(-float((f3.get("ret",0.0) or 0.0) / max(1e-9, f3.get("uncertainty",1.0) or 1.0))))
+                p5 = 1.0 / (1.0 + np.exp(-float((f5.get("ret",0.0) or 0.0) / max(1e-9, f5.get("uncertainty",1.0) or 1.0))))
+                self.es.append(mk_event(env, "SHORT_TERM_LEVEL_PROB", "INFO", {
+                    "p_up_3m": float(p3),
+                    "p_up_5m": float(p5),
+                    "ret_3m": float(f3.get("ret",0.0) or 0.0),
+                    "ret_5m": float(f5.get("ret",0.0) or 0.0),
+                    "unc_3m": float(f3.get("uncertainty",1.0) or 1.0),
+                    "unc_5m": float(f5.get("uncertainty",1.0) or 1.0),
+                    "breakout_strength": float(getattr(pattern, "breakout_strength", 0.0)),
+                }))
 
                 # enrich features for gate + model-b observability
                 f1 = forecast.get("m1", {}) if isinstance(forecast, dict) else {}
@@ -379,6 +392,10 @@ class Engine:
             "equity": self.portfolio.account.equity,
             "open_positions": len(self.portfolio.positions),
         }))
+        try:
+            self.es.append(mk_event(base, "TRADE_OUTCOME_STATS", "INFO", self.portfolio.stats()))
+        except Exception:
+            pass
         pos_payload = {"positions": {k: {
             "symbol": v.symbol, "side": v.side, "entry": v.entry, "qty": v.qty,
             "sl": v.sl, "tp1": v.tp1, "tp2": v.tp2, "open_ts": v.open_ts

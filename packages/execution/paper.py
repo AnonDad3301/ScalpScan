@@ -51,6 +51,7 @@ class PaperPortfolio:
         self.per_trade_alloc_pct = float(ex.get("per_trade_alloc_pct", 0.10))
         self.total_alloc_pct = float(ex.get("total_alloc_pct", 0.30))
         self.smart_sl = ex.get("smart_sl", {})
+        self.trade_stats: Dict[str, int] = {"total_closed": 0, "wins": 0, "sl": 0, "breakeven": 0, "loss": 0}
 
     def _cost_mult(self) -> float:
         return (self.fees_bps + self.slip_bps) / 10000.0
@@ -232,6 +233,17 @@ class PaperPortfolio:
         self.update_equity(prices)
         return updates, closed
 
+
+
+    def stats(self) -> Dict[str, float]:
+        total = int(self.trade_stats.get("total_closed", 0))
+        wins = int(self.trade_stats.get("wins", 0))
+        sl = int(self.trade_stats.get("sl", 0))
+        be = int(self.trade_stats.get("breakeven", 0))
+        loss = int(self.trade_stats.get("loss", 0))
+        win_rate = float(wins) / max(1, total)
+        return {"total_closed": total, "wins": wins, "sl": sl, "breakeven": be, "loss": loss, "win_rate": win_rate}
+
     def _realize_partial(self, pos: Position, price: float, qty_close: float) -> float:
         qty_close = max(0.0, min(qty_close, pos.qty))
         if qty_close <= 0:
@@ -247,6 +259,15 @@ class PaperPortfolio:
     def _close(self, sym: str, pos: Position, price: float, ts: int, reason: str) -> Dict[str, Any]:
         self._realize_partial(pos, price, pos.qty)
         total = pos.realized
+        self.trade_stats["total_closed"] = int(self.trade_stats.get("total_closed", 0)) + 1
+        if reason == "SL":
+            self.trade_stats["sl"] = int(self.trade_stats.get("sl", 0)) + 1
+        if abs(float(total)) <= 1e-9:
+            self.trade_stats["breakeven"] = int(self.trade_stats.get("breakeven", 0)) + 1
+        elif float(total) > 0:
+            self.trade_stats["wins"] = int(self.trade_stats.get("wins", 0)) + 1
+        else:
+            self.trade_stats["loss"] = int(self.trade_stats.get("loss", 0)) + 1
         del self.positions[sym]
         return {
             "symbol": sym, "side": pos.side,

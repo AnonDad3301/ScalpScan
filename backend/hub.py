@@ -374,6 +374,7 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
                 "TICK_TIMEOUT","TICK_ERROR","TICK_DONE",
                 "ACCOUNT","PRICES_SNAPSHOT","POSITIONS_SNAPSHOT",
                 "MODEL_INFERRED","GATE_DECISION","STALL_DETECTED",
+                "SHORT_TERM_LEVEL_PROB","TRADE_OUTCOME_STATS",
                 "MODEL_B_LOAD_START","MODEL_B_LOAD_END","MODEL_B_INFERRED",
                 "MODEL_B_DATASET_APPEND","MODEL_B_STATUS","MODEL_B_RETRAIN","MODEL_B_RETRAIN_SKIPPED","MODEL_B_TRAINING_STATUS","MODEL_B_PROMOTED"
             )]
