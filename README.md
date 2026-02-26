@@ -115,3 +115,20 @@ v1.3.8: POSITIONS_SNAPSHOT persisted; WS ping disabled; websockets logs silenced
 - Iteration 2: OrderBookTracker (wall age/touches), FEATURES_SNAPSHOT, SETUP_EVENT.
 - Iteration 3: PatchTST Model B loader (HF auto-download) + MODEL_B_INFERRED scaffold.
 - Iteration 4: Breakeven rule (MOVE_SL_BE) near TP1 in paper execution.
+
+## v1.7.0 (архитектурная модернизация)
+- Добавлен `monitoring_api` на `aiohttp` (`/healthz`, `/state`) для real-time мониторинга состояния хаба.
+- В runtime добавлен слой market intelligence:
+  - `MARKET_PATTERN_SCAN` (Volume Profile POC + breakout detection),
+  - `REGIME_DETECTED` (calm/trend/volatile),
+  - `MULTI_HORIZON_FORECAST` (1/3/5/15 минут + uncertainty).
+- Новые параметры в `config.yaml`:
+  - `runtime.monitoring_host`, `runtime.monitoring_port`,
+  - секция `modernization` для тюнинга сканера/форкастера/детектора режима.
+
+## v1.7.1 (stability + training UX)
+- Fixed Desktop `NameError: write_cmd is not defined` for Model-B control buttons.
+- Added Model-B/MLOps progress indicators and dataset stats in UI tabs.
+- Enriched runtime features (`spread_bps`, `volz`, microstructure walls) and export of `FEATURES_SNAPSHOT`/`SETUP_EVENT`.
+- Improved gate filters (uncertainty, risk/reward, trend strength) to reduce low-quality entries.
+- Fixed Model-B retrain metric mapping (`acc`) and retrain interval config handling.

@@ -14,6 +14,8 @@ runtime:
   price_timeout_sec: 1.0
   ws_host: 127.0.0.1
   ws_port: 8766
+  monitoring_host: 127.0.0.1
+  monitoring_port: 8081
   ccxt:
     options:
       defaultType: swap
@@ -53,6 +55,9 @@ gate:
       adx_min: 8
       spread_max: 1.5
       volz_max: 3.5
+      uncertainty_max: 0.02
+      rr_min: 1.2
+      trend_strength_min: 0.05
 execution:
   deposit_usd: 2000
   risk_usd: 50
@@ -88,3 +93,11 @@ model_b:
 pricing:
   price_source: mark
   timezone: UTC
+
+modernization:
+  volume_profile_bins: 24
+  breakout_window: 20
+  forecast_horizons: [1, 3, 5, 15]
+  forecast_mc_samples: 64
+  regime_volatility_threshold: 0.004
+  regime_trend_threshold: 0.25

@@ -23,6 +23,7 @@ from packages.infra.market.ccxt_market import CCXTMarket
 from apps.runtime.engine import Engine
 from backend.bybit_ws_prices import BybitPublicWS
 from backend.price_worker import PriceWorker
+from backend.monitoring_api import start_monitoring_api
 from packages.obs.telemetry import Telemetry
 
 
@@ -217,6 +218,16 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
         while True:
             t0 = time.time()
             syms = list(getattr(eng.portfolio, "positions", {}).keys())
+            ws_connected=False; ws_stale_ms=None; ws_ticker_1s=None; ws_sub_ok=None; ws_sub_err=None
+            try:
+                _, st = await ws_client.get_prices()
+                ws_connected = bool(st.connected)
+                ws_ticker_1s = int(st.ticker_updates_1s)
+                ws_sub_ok = int(st.sub_ok)
+                ws_sub_err = int(st.sub_err)
+                ws_stale_ms = int(time.time()*1000) - int(st.last_msg_ms)
+            except Exception:
+                pass
             try:
                 await ws_client.set_desired(syms)
             except Exception:
@@ -241,6 +252,7 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
             except Exception:
                 pass
             prices: Dict[str, float] = {}
+            pm: Dict[str, Any] = {"status": "SKIP", "reason": "no_symbols"}
             status = "OK"
             try:
                 if syms:
@@ -278,10 +290,9 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
                             'stale': stale,
                             'missing_n': len(missing),
                         }, run_id='price')
-                    prices, pm = price_worker.fetch_prices(syms, timeout_sec=price_timeout)
                 if not isinstance(prices, dict):
                     prices = {}
-                if pm.get("status") != "OK":
+                if syms and pm.get("status") != "OK":
                     append_event(es, rt, "PRICE_WORKER", pm, run_id="price", level="ERROR")
 
 
@@ -344,17 +355,6 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
 
             dt_ms = int((time.time()-t0)*1000)
             liveness["price"] = time.monotonic()
-            # WS diagnostics
-            ws_connected=False; ws_stale_ms=None; ws_ticker_1s=None; ws_sub_ok=None; ws_sub_err=None
-            try:
-                _, st = await ws_client.get_prices()
-                ws_connected = bool(st.connected)
-                ws_ticker_1s = int(st.ticker_updates_1s)
-                ws_sub_ok = int(st.sub_ok)
-                ws_sub_err = int(st.sub_err)
-                ws_stale_ms = int(time.time()*1000) - int(st.last_msg_ms)
-            except Exception:
-                pass
             append_event(es, rt, "PRICE_TICK", {"open_positions": len(syms), "prices_n": len(prices), "dt_ms": dt_ms, "status": status, "symbols": syms[:50], "ws_connected": ws_connected, "ws_stale_ms": ws_stale_ms, "ws_ticker_1s": ws_ticker_1s, "ws_sub_ok": ws_sub_ok, "ws_sub_err": ws_sub_err}, run_id="price")
 
             try:
@@ -480,6 +480,14 @@ async def main():
 
     host = rt.get("ws_host", "127.0.0.1")
     port = int(rt.get("ws_port", 8765))
+    mon_host = rt.get("monitoring_host", "127.0.0.1")
+    mon_port = int(rt.get("monitoring_port", 8081))
+    mon_server = await start_monitoring_api(mon_host, mon_port, STATE)
+    if mon_server is not None:
+        append_event(es, rt, "MONITORING_API_READY", {"host": mon_host, "port": mon_port}, run_id="sys", level="INFO")
+    else:
+        append_event(es, rt, "MONITORING_API_DISABLED", {"reason": "aiohttp_missing"}, run_id="sys", level="INFO")
+
     asyncio.create_task(COMMANDS.pump(eng, cfg, market, symdb))
 
     async with legacy_serve(handler, host, port, ping_interval=None, ping_timeout=None, logger=None):
