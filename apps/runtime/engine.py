@@ -111,6 +111,7 @@ class Engine:
         self.es.append(mk_event(base,"UNIVERSE_SELECTED","INFO",{"selected_n":len(symbols),"selected":symbols[:1000]}))
 
         prices: Dict[str, float] = {}
+        market_ctx: Dict[str, Dict[str, Any]] = {}
 
         for sym in symbols:
             env=dict(base); env["symbol"]=sym
@@ -136,6 +137,24 @@ class Engine:
                 }))
 
                 feats=compute_features(ohlcv, ob)
+                try:
+                    self.ob_tracker.update(sym, ob, last_close)
+                    walls = self.ob_tracker.strongest_walls(sym, last_close, topk=3)
+                    bid_wall = next((w for w in walls if w.side == "BID"), None)
+                    ask_wall = next((w for w in walls if w.side == "ASK"), None)
+                    market_ctx[sym] = {
+                        "imbalance": float(ob.get("imbalance", 0.0) or 0.0),
+                        "spread": float(ob.get("spread", 0.0) or 0.0),
+                        "bid_wall": float(bid_wall.price) if bid_wall else 0.0,
+                        "ask_wall": float(ask_wall.price) if ask_wall else 0.0,
+                        "bid_wall_age": float(bid_wall.age_sec) if bid_wall else 0.0,
+                        "ask_wall_age": float(ask_wall.age_sec) if ask_wall else 0.0,
+                    }
+                except Exception:
+                    market_ctx[sym] = {
+                        "imbalance": float(ob.get("imbalance", 0.0) or 0.0),
+                        "spread": float(ob.get("spread", 0.0) or 0.0),
+                    }
                 inv=inv_check(feats, self.cfg["features"]["invariants"])
                 self.es.append(mk_event(env,"FEATURES_COMPUTED","INFO",{"features":feats,"invariants":inv}))
                 if not inv_ok(inv):
@@ -176,7 +195,7 @@ class Engine:
 
                 # Model-B shadow inference + dataset shadow label
                 try:
-                    feats={
+                    model_b_feats={
                         "ret_last": float(gate.get("ret_last",0.0) if isinstance(gate,dict) else 0.0),
                         "range_last": float(gate.get("range_last",0.0) if isinstance(gate,dict) else 0.0),
                         "vol_z_last": float(gate.get("vol_z_last",0.0) if isinstance(gate,dict) else 0.0),
@@ -186,17 +205,18 @@ class Engine:
                         "wall_age": float(gate.get("wall_age",0.0) if isinstance(gate,dict) else 0.0),
                         "wall_touches": float(gate.get("wall_touches",0.0) if isinstance(gate,dict) else 0.0),
                     }
-                    prob=self.model_b_trainer.infer_prob(feats)
+                    prob=self.model_b_trainer.infer_prob(model_b_feats)
                     thr=float(self.cfg.get("model_b",{}).get("model_b_prob_min",0.55))
                     decision_b="PASS" if prob>=thr else "FAIL"
-                    self.es.append(mk_event(env,"MODEL_B_INFERRED","INFO",{"prob_head":prob,"prob_backbone":0.5,"thr":thr,"decision":decision_b,**feats}))
+                    self.es.append(mk_event(env,"MODEL_B_INFERRED","INFO",{"prob_head":prob,"prob_backbone":0.5,"thr":thr,"decision":decision_b,**model_b_feats}))
                     h=int(self.ds_builder.horizon_bars)
                     if ohlcv and len(ohlcv)>(h+2):
                         i=len(ohlcv)-(h+2)
                         c0=float(ohlcv[i][4]); c1=float(ohlcv[i+h][4])
                         ret=(c1-c0)/max(1e-12,c0)
                         self.ds_builder.append_shadow(int(time.time()*1000), sym, int(ohlcv[-2][0]) if len(ohlcv)>1 else 0,
-                                                     int(time.time()*1000), price_source, "bybit.linear.swap", feats, ret)
+                                                     int(time.time()*1000), price_source, "bybit.linear.swap", model_b_feats, ret)
+                        self.es.append(mk_event(env, "MODEL_B_DATASET_APPEND", "INFO", {"symbol": sym, "rows": self.ds_builder.stats().get("rows", 0), "ret": ret, "label": 1 if ret > 0 else 0}))
                 except Exception as e:
                     self.es.append(mk_event(env,"ERROR","ERROR",{"where":"MODEL_B_SHADOW","err":str(e)}))
 
@@ -227,9 +247,18 @@ class Engine:
                 self.es.append(mk_event(base, "MODEL_B_RETRAIN", "INFO", {
                     "auc": getattr(mB,"auc",0.0),
                     "pr_auc": getattr(mB,"pr_auc",0.0),
-                    "acc": getattr(mB,"accuracy",0.0),
+                    "acc": getattr(mB,"acc",0.0),
                     "samples": getattr(mB,"samples",0),
                     "promoted": bool(promoted)
+                }))
+            else:
+                st = self.ds_builder.stats() if hasattr(self, "ds_builder") else {}
+                cooldown_left_ms = max(0, int(getattr(self.model_b_trainer, "retrain_ms", 0) - (now_ms() - int(getattr(self.model_b_trainer, "last_train_ms", 0)))))
+                self.es.append(mk_event(base, "MODEL_B_RETRAIN_SKIPPED", "INFO", {
+                    "rows": st.get("rows", 0),
+                    "need_rows": 200,
+                    "cooldown_left_ms": cooldown_left_ms,
+                    "training_disabled": bool(disable_b),
                 }))
         except Exception as e:
             self.es.append(mk_event(base, "ERROR", "ERROR", {"where": "MODEL_B_RETRAIN", "err": str(e)}))
@@ -261,7 +290,7 @@ class Engine:
 
         # manage open positions (exit manager)
         try:
-            updates, closed = self.portfolio.manage_positions(now_ms(), prices)
+            updates, closed = self.portfolio.manage_positions(now_ms(), prices, market_ctx=market_ctx)
             for u in updates:
                 self.es.append(mk_event(base, "POSITION_UPDATE", "INFO", u))
             for c in closed:
@@ -298,88 +327,10 @@ class Engine:
                 'training_disabled': bool(disable_b),
             }
             if m is not None:
-                mp.update({'auc': getattr(m,'auc',0.0), 'pr_auc': getattr(m,'pr_auc',0.0), 'acc': getattr(m,'accuracy',0.0), 'samples': getattr(m,'samples',0)})
+                mp.update({'auc': getattr(m,'auc',0.0), 'pr_auc': getattr(m,'pr_auc',0.0), 'acc': getattr(m,'acc',0.0), 'samples': getattr(m,'samples',0)})
             self.es.append(mk_event(base, 'MODEL_B_STATUS', 'INFO', mp))
         except Exception:
             pass
 
 
-        # Model-B status heartbeat
-
-        try:
-
-            st=self.ds_builder.stats()
-
-            self.es.append(mk_event({"run_id":run_id,"service":"sf-runtime","exchange":self.exchange,"market":self.market,"timeframe":self.timeframe,"symbol":"*"},
-
-                                    "MODEL_B_STATUS","INFO",{"dataset_rows": st.get("rows",0), "dataset_path": st.get("path",""), "price_source": price_source}))
-
-        except Exception:
-
-            pass
-
-
-        # Model-B retrain schedule
-
-        try:
-
-            flags=getattr(self,'runtime_flags',{}) or {}
-
-            force_b=bool(flags.get('force_model_b_retrain',False))
-
-            disable_b=bool(flags.get('disable_model_b_training',False))
-
-            if not disable_b:
-
-                mtr,prom=self.model_b_trainer.maybe_retrain(int(time.time()*1000), force=force_b)
-
-                if mtr is not None:
-
-                    self.es.append(mk_event({"run_id":run_id,"service":"sf-runtime","exchange":self.exchange,"market":self.market,"timeframe":self.timeframe,"symbol":"*"},
-
-                                            "MODEL_B_RETRAIN","INFO",{"auc":mtr.auc,"pr_auc":mtr.pr_auc,"acc":mtr.acc,"samples":mtr.samples,"promoted":bool(prom)}))
-
-                    if prom:
-
-                        self.es.append(mk_event({"run_id":run_id,"service":"sf-runtime","exchange":self.exchange,"market":self.market,"timeframe":self.timeframe,"symbol":"*"},
-
-                                                "MODEL_B_PROMOTED","INFO",{"samples":mtr.samples,"auc":mtr.auc}))
-
-        except Exception as e:
-
-            self.es.append(mk_event({"run_id":run_id,"service":"sf-runtime","exchange":self.exchange,"market":self.market,"timeframe":self.timeframe,"symbol":"*"},
-
-                                    "ERROR","ERROR",{"where":"MODEL_B_RETRAIN","err":str(e)}))
-
-
-        # Accounting reconciliation
-
-        try:
-
-            cash=float(getattr(self.portfolio,'cash',0.0))
-
-            upnl=float(getattr(self.portfolio,'unrealized_pnl',0.0)) if hasattr(self.portfolio,'unrealized_pnl') else 0.0
-
-            equity=float(getattr(self.portfolio,'equity',cash+upnl))
-
-            calc=cash+upnl
-
-            diff=calc-equity
-
-            self.es.append(mk_event({"run_id":run_id,"service":"sf-runtime","exchange":self.exchange,"market":self.market,"timeframe":self.timeframe,"symbol":"*"},
-
-                                    "ACCOUNT","INFO",{"cash":cash,"upnl":upnl,"equity":equity,"equity_calc":calc,"diff":diff,"price_source": price_source}))
-
-            if abs(diff) > max(1e-6, abs(equity)*1e-4):
-
-                self.es.append(mk_event({"run_id":run_id,"service":"sf-runtime","exchange":self.exchange,"market":self.market,"timeframe":self.timeframe,"symbol":"*"},
-
-                                        "ACCOUNT_MISMATCH","ERROR",{"cash":cash,"upnl":upnl,"equity":equity,"equity_calc":calc,"diff":diff}))
-
-        except Exception:
-
-            pass
-
-
         return run_id
-

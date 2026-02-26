@@ -21,6 +21,8 @@ CATALOG: Dict[str, Tuple[str, str]] = {
     "MODEL_B_INFERRED": ("Model-B: инференс", "Model-B: inference"),
     "MODEL_B_STATUS": ("Model-B: статус", "Model-B: status"),
     "MODEL_B_RETRAIN": ("Model-B: переобучение", "Model-B: retrain"),
+    "MODEL_B_RETRAIN_SKIPPED": ("Model-B: переобучение пропущено", "Model-B: retrain skipped"),
+    "MODEL_B_DATASET_APPEND": ("Model-B: датасет пополнен", "Model-B: dataset appended"),
     "MODEL_B_PROMOTED": ("Model-B: промоут", "Model-B: promoted"),
     "MODEL_B_ROLLBACK": ("Model-B: откат", "Model-B: rollback"),
     "CMD": ("Команда UI", "UI command"),
