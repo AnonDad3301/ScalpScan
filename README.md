@@ -125,3 +125,10 @@ v1.3.8: POSITIONS_SNAPSHOT persisted; WS ping disabled; websockets logs silenced
 - Новые параметры в `config.yaml`:
   - `runtime.monitoring_host`, `runtime.monitoring_port`,
   - секция `modernization` для тюнинга сканера/форкастера/детектора режима.
+
+## v1.7.1 (stability + training UX)
+- Fixed Desktop `NameError: write_cmd is not defined` for Model-B control buttons.
+- Added Model-B/MLOps progress indicators and dataset stats in UI tabs.
+- Enriched runtime features (`spread_bps`, `volz`, microstructure walls) and export of `FEATURES_SNAPSHOT`/`SETUP_EVENT`.
+- Improved gate filters (uncertainty, risk/reward, trend strength) to reduce low-quality entries.
+- Fixed Model-B retrain metric mapping (`acc`) and retrain interval config handling.

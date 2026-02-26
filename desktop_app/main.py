@@ -23,6 +23,14 @@ def fmt_ts(ts_ms: Any) -> str:
     except Exception:
         return ""
 
+def write_cmd(cfg: Dict[str, Any], cmd: str) -> None:
+    storage = cfg.get("storage", {}) if isinstance(cfg, dict) else {}
+    path = ROOT / str(storage.get("commands_file", "data/ui_commands.jsonl"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"id": int(time.time() * 1000), "ts": int(time.time() * 1000), "cmd": str(cmd)}
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
 class WSClient(QtCore.QThread):
     message = Signal(dict)
     status = Signal(str)
@@ -292,6 +300,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(w,"Логи/Экспорт")
 
     # WS handlers
+    def _send_modelb_cmd(self, cmd: str):
+        try:
+            write_cmd(self.cfg, cmd)
+            self.txt_log.appendPlainText(f"cmd queued: {cmd}")
+        except Exception as e:
+            self.txt_log.appendPlainText(f"cmd error: {cmd}: {e}")
+
     def on_connected(self, ok: bool):
         self.ws_connected = ok
 
@@ -390,6 +405,59 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.tbl_syms.set_rows([[i+1, s] for i,s in enumerate(self.symbols[:4000])])
 
+        # model-b / dataset / mlops / levels
+        modelb_rows=[]; mlops_rows=[]; levels_rows=[]
+        latest_mb=None
+        for e in self.events[-2000:]:
+            stg=e.get("stage"); p=e.get("payload",{}) or {}
+            ts=fmt_ts(e.get("ts")); sym=e.get("symbol")
+            if stg=="MODEL_B_INFERRED":
+                latest_mb=p
+                modelb_rows.append([
+                    ts, sym, p.get("prob_head"), p.get("prob_backbone"),
+                    p.get("wall_age"), p.get("wall_touches"), p.get("wall_dist_bps"),
+                    p.get("decision"), p.get("thr"), "OK"
+                ])
+            elif stg=="MODEL_B_RETRAIN":
+                mlops_rows.append([ts, p.get("auc"), p.get("pr_auc"), p.get("acc"), p.get("samples"), p.get("promoted")])
+            elif stg in ("FEATURES_SNAPSHOT","SETUP_EVENT"):
+                levels_rows.append([ts, sym, p.get("imb"), p.get("spread_bps"), p.get("wall_age"), p.get("wall_touches"), p.get("wall_dist_bps")])
+
+        if latest_mb:
+            self.lbl_modelb.setText(f"Model-B: prob={float(latest_mb.get('prob_head',0.0)):.3f} thr={float(latest_mb.get('thr',0.0)):.3f} decision={latest_mb.get('decision')}")
+            self.pb_modelb.setValue(max(0, min(100, int(float(latest_mb.get('prob_head',0.0))*100))))
+        self.tbl_modelb.set_rows(modelb_rows[-500:])
+
+        ds_path=Path(self.root_dir)/str(self.cfg.get('storage',{}).get('model_b_dataset','data/datasets/model_b_samples.csv'))
+        ds_rows=0; pos_pct=0.0; last_ts=''
+        if ds_path.exists():
+            try:
+                with ds_path.open('r', encoding='utf-8') as f:
+                    rows=list(csv.reader(f))
+                if len(rows)>1:
+                    body=rows[1:]
+                    ds_rows=len(body)
+                    labels=[int(float(r[2])) for r in body if len(r)>2]
+                    if labels:
+                        pos_pct=100.0*sum(labels)/len(labels)
+                    last_ts=rows[-1][0] if len(rows[-1])>0 else ''
+            except Exception:
+                pass
+        self.lbl_ds.setText(f"Dataset: rows={ds_rows} positive={pos_pct:.1f}%")
+        self.tbl_ds.set_rows([[ds_rows, f"{pos_pct:.1f}%", last_ts, str(ds_path)]])
+
+        self.tbl_mlops.set_rows(mlops_rows[-300:])
+        if mlops_rows:
+            last=mlops_rows[-1]
+            auc=float(last[1] or 0.0)
+            self.lbl_mlops.setText(f"MLOps: dataset_rows={ds_rows}, retrains={len(mlops_rows)}")
+            self.pb_auc.setValue(max(0, min(100, int(auc*100))))
+        else:
+            self.lbl_mlops.setText(f"MLOps: dataset_rows={ds_rows}, retrains=0")
+            self.pb_auc.setValue(0)
+
+        self.tbl_levels.set_rows(levels_rows[-500:])
+
         # closed trades
         closed_rows=[]
         for e in self.events[-4000:]:
@@ -441,11 +509,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _tab_modelb(self):
         w=QWidget(); lay=QVBoxLayout(w)
         self.lbl_modelb=QLabel("Model-B: нет данных"); lay.addWidget(self.lbl_modelb)
+        self.pb_modelb=QtWidgets.QProgressBar(); self.pb_modelb.setRange(0,100); self.pb_modelb.setValue(0)
+        lay.addWidget(self.pb_modelb)
         btns=QHBoxLayout()
-        b1=QPushButton("Force retrain"); b1.clicked.connect(lambda: write_cmd(self.cfg, "force_model_b_retrain"))
-        b2=QPushButton("Disable training"); b2.clicked.connect(lambda: write_cmd(self.cfg, "disable_model_b_training"))
-        b3=QPushButton("Enable training"); b3.clicked.connect(lambda: write_cmd(self.cfg, "enable_model_b_training"))
-        b4=QPushButton("Rollback"); b4.clicked.connect(lambda: write_cmd(self.cfg, "rollback_model_b"))
+        b1=QPushButton("Force retrain"); b1.clicked.connect(lambda: self._send_modelb_cmd("force_model_b_retrain"))
+        b2=QPushButton("Disable training"); b2.clicked.connect(lambda: self._send_modelb_cmd("disable_model_b_training"))
+        b3=QPushButton("Enable training"); b3.clicked.connect(lambda: self._send_modelb_cmd("enable_model_b_training"))
+        b4=QPushButton("Rollback"); b4.clicked.connect(lambda: self._send_modelb_cmd("rollback_model_b"))
         for b in (b1,b2,b3,b4): btns.addWidget(b)
         lay.addLayout(btns)
         self.tbl_modelb=SimpleTable(["Time","Symbol","Prob(head)","Prob(backbone)","wall_age","touches","dist_bps","Decision","thr","Status"])
@@ -462,6 +532,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _tab_mlops(self):
         w=QWidget(); lay=QVBoxLayout(w)
         self.lbl_mlops=QLabel("MLOps: нет retrain"); lay.addWidget(self.lbl_mlops)
+        self.pb_auc=QtWidgets.QProgressBar(); self.pb_auc.setRange(0,100); self.pb_auc.setValue(0)
+        lay.addWidget(self.pb_auc)
         self.tbl_mlops=SimpleTable(["Time","AUC","PR_AUC","ACC","Samples","Promoted"])
         lay.addWidget(self.tbl_mlops)
         self.tabs.addTab(w, "MLOps")

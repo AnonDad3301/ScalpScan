@@ -136,16 +136,51 @@ class Engine:
                 }))
 
                 feats=compute_features(ohlcv, ob)
+                arr=np.array([c for _,_,_,_,c,_ in ohlcv], dtype=float)
+
+                # microstructure/levels features
+                try:
+                    mid = float((arr[-1] + arr[-1]) / 2.0) if len(arr) else 0.0
+                    self.ob_tracker.update(sym, ob, max(1e-12, mid))
+                    walls = self.ob_tracker.strongest_walls(sym, max(1e-12, mid), topk=1)
+                except Exception:
+                    walls = []
+                wall = walls[0] if walls else None
+                feats["wall_age"] = float(getattr(wall, "age_sec", 0.0) or 0.0)
+                feats["wall_touches"] = float(getattr(wall, "touch_count", 0.0) or 0.0)
+                feats["wall_dist_bps"] = float(getattr(wall, "dist_bps", 0.0) or 0.0)
+
+                pattern = self.pattern_scanner.scan(ohlcv)
+                regime = self.regime_detector.detect(arr)
+                forecast = self.forecaster.predict(arr)
+                fc3 = forecast.get("m3", {})
+                feats["forecast_ret_3m"] = float(fc3.get("ret", 0.0) if isinstance(fc3, dict) else 0.0)
+                feats["forecast_uncertainty_3m"] = float(fc3.get("uncertainty", 1.0) if isinstance(fc3, dict) else 1.0)
+                feats["trend_strength"] = float(getattr(regime, "trend_strength", 0.0))
+                atr = float(feats.get("atr", 0.0) or 0.0)
+                rr = (2.0 * atr) / max(1e-12, 1.2 * atr) if atr > 0 else 0.0
+                feats["rr_ratio"] = float(rr)
+
                 inv=inv_check(feats, self.cfg["features"]["invariants"])
                 self.es.append(mk_event(env,"FEATURES_COMPUTED","INFO",{"features":feats,"invariants":inv}))
+                self.es.append(mk_event(env, "FEATURES_SNAPSHOT", "INFO", {
+                    "imb": feats.get("ob_imb", 0.0),
+                    "spread_bps": feats.get("spread_bps", 0.0),
+                    "wall_age": feats.get("wall_age", 0.0),
+                    "wall_touches": feats.get("wall_touches", 0.0),
+                    "wall_dist_bps": feats.get("wall_dist_bps", 0.0),
+                }))
+                self.es.append(mk_event(env, "SETUP_EVENT", "INFO", {
+                    "regime": regime.name,
+                    "forecast_ret_3m": feats.get("forecast_ret_3m", 0.0),
+                    "forecast_unc_3m": feats.get("forecast_uncertainty_3m", 1.0),
+                    "rr_ratio": feats.get("rr_ratio", 0.0),
+                    "poc": pattern.volume_profile_poc,
+                }))
                 if not inv_ok(inv):
                     self.es.append(mk_event(env,"GATE_DECISION","INFO",{"decision":"FAIL","reasons":["INVARIANTS_OK"]}))
                     continue
 
-                arr=np.array([c for _,_,_,_,c,_ in ohlcv], dtype=float)
-                pattern = self.pattern_scanner.scan(ohlcv)
-                regime = self.regime_detector.detect(arr)
-                forecast = self.forecaster.predict(arr)
                 self.es.append(mk_event(env, "MARKET_PATTERN_SCAN", "INFO", pattern.as_dict()))
                 self.es.append(mk_event(env, "REGIME_DETECTED", "INFO", regime.as_dict()))
                 self.es.append(mk_event(env, "MULTI_HORIZON_FORECAST", "INFO", {"forecast": forecast}))
@@ -176,7 +211,7 @@ class Engine:
 
                 # Model-B shadow inference + dataset shadow label
                 try:
-                    feats={
+                    b_feats={
                         "ret_last": float(gate.get("ret_last",0.0) if isinstance(gate,dict) else 0.0),
                         "range_last": float(gate.get("range_last",0.0) if isinstance(gate,dict) else 0.0),
                         "vol_z_last": float(gate.get("vol_z_last",0.0) if isinstance(gate,dict) else 0.0),
@@ -186,17 +221,17 @@ class Engine:
                         "wall_age": float(gate.get("wall_age",0.0) if isinstance(gate,dict) else 0.0),
                         "wall_touches": float(gate.get("wall_touches",0.0) if isinstance(gate,dict) else 0.0),
                     }
-                    prob=self.model_b_trainer.infer_prob(feats)
+                    prob=self.model_b_trainer.infer_prob(b_feats)
                     thr=float(self.cfg.get("model_b",{}).get("model_b_prob_min",0.55))
                     decision_b="PASS" if prob>=thr else "FAIL"
-                    self.es.append(mk_event(env,"MODEL_B_INFERRED","INFO",{"prob_head":prob,"prob_backbone":0.5,"thr":thr,"decision":decision_b,**feats}))
+                    self.es.append(mk_event(env,"MODEL_B_INFERRED","INFO",{"prob_head":prob,"prob_backbone":0.5,"thr":thr,"decision":decision_b,**b_feats}))
                     h=int(self.ds_builder.horizon_bars)
                     if ohlcv and len(ohlcv)>(h+2):
                         i=len(ohlcv)-(h+2)
                         c0=float(ohlcv[i][4]); c1=float(ohlcv[i+h][4])
                         ret=(c1-c0)/max(1e-12,c0)
                         self.ds_builder.append_shadow(int(time.time()*1000), sym, int(ohlcv[-2][0]) if len(ohlcv)>1 else 0,
-                                                     int(time.time()*1000), price_source, "bybit.linear.swap", feats, ret)
+                                                     int(time.time()*1000), price_source, "bybit.linear.swap", b_feats, ret)
                 except Exception as e:
                     self.es.append(mk_event(env,"ERROR","ERROR",{"where":"MODEL_B_SHADOW","err":str(e)}))
 
@@ -227,9 +262,16 @@ class Engine:
                 self.es.append(mk_event(base, "MODEL_B_RETRAIN", "INFO", {
                     "auc": getattr(mB,"auc",0.0),
                     "pr_auc": getattr(mB,"pr_auc",0.0),
-                    "acc": getattr(mB,"accuracy",0.0),
+                    "acc": getattr(mB,"acc",0.0),
                     "samples": getattr(mB,"samples",0),
                     "promoted": bool(promoted)
+                }))
+            else:
+                self.es.append(mk_event(base, "MODEL_B_TRAINING_STATUS", "INFO", {
+                    "disabled": bool(disable_b),
+                    "dataset_path": self.ds_builder.path,
+                    "rows": int(self.ds_builder.stats().get("rows", 0)),
+                    "force": bool(force_b)
                 }))
         except Exception as e:
             self.es.append(mk_event(base, "ERROR", "ERROR", {"where": "MODEL_B_RETRAIN", "err": str(e)}))

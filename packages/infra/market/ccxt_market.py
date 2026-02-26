@@ -61,7 +61,7 @@ class CCXTMarket:
         denom = bid_vol + ask_vol if (bid_vol+ask_vol)!=0 else 1.0
         imb = (bid_vol - ask_vol) / denom
         ts = int(ob.get("timestamp") or (time.time()*1000))
-        return {"ts": ts, "depth": depth, "spread": spread, "imbalance": imb, "bid_vol": bid_vol, "ask_vol": ask_vol}
+        return {"ts": ts, "depth": depth, "spread": spread, "spread_bps": (spread/max(1e-12,float(bids[0][0]))*10000.0 if bids else 0.0), "imbalance": imb, "bid_vol": bid_vol, "ask_vol": ask_vol, "bids": bids[:depth], "asks": asks[:depth]}
 
     def fetch_prices(self, symbols: List[str], price_source: str = 'last') -> Dict[str, float]:
         out={}

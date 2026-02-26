@@ -9,7 +9,8 @@ class Trainer:
     def __init__(self, dataset_path: str, registry: Registry, retrain_sec: float = 1800.0, retrain_interval_sec: float | None = None, **kwargs):
         self.dataset_path=dataset_path
         self.registry=registry
-        self.retrain_ms=int(retrain_sec*1000)
+        interval = retrain_interval_sec if retrain_interval_sec is not None else retrain_sec
+        self.retrain_ms=int(float(interval)*1000)
         self.last_train_ms=0
         self.head=self.registry.load_current("model_b_head") or ModelBHead()
         self.last_metrics: Optional[Metrics]=None
@@ -56,3 +57,10 @@ class Trainer:
             return float(self.head.infer_one(feats))
         except Exception:
             return 0.5
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "last_train_ms": int(self.last_train_ms),
+            "retrain_ms": int(self.retrain_ms),
+            "has_metrics": bool(self.last_metrics is not None),
+        }

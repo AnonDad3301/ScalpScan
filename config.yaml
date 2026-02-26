@@ -55,6 +55,9 @@ gate:
       adx_min: 8
       spread_max: 1.5
       volz_max: 3.5
+      uncertainty_max: 0.02
+      rr_min: 1.2
+      trend_strength_min: 0.05
 execution:
   deposit_usd: 2000
   risk_usd: 50
