@@ -14,6 +14,7 @@ class Trainer:
         self.last_train_ms=0
         self.head=self.registry.load_current("model_b_head") or ModelBHead()
         self.last_metrics: Optional[Metrics]=None
+        self.last_retrain_reason: str = "init"
 
     def _load(self)->Optional[Tuple[np.ndarray,np.ndarray]]:
         if not os.path.exists(self.dataset_path):
@@ -35,9 +36,11 @@ class Trainer:
 
     def maybe_retrain(self, now_ms:int, force:bool=False)->Tuple[Optional[Metrics], bool]:
         if (not force) and (now_ms-self.last_train_ms)<self.retrain_ms:
+            self.last_retrain_reason = "cooldown"
             return self.last_metrics, False
         data=self._load()
         if data is None:
+            self.last_retrain_reason = "insufficient_dataset"
             return self.last_metrics, False
         X,y=data
         head=ModelBHead()
@@ -50,6 +53,7 @@ class Trainer:
             self.registry.promote(info)
             self.head=head
             promoted=True
+        self.last_retrain_reason = "trained"
         return m, promoted
 
     def infer_prob(self, feats: Dict[str,Any])->float:
@@ -57,3 +61,27 @@ class Trainer:
             return float(self.head.infer_one(feats))
         except Exception:
             return 0.5
+
+
+    def dataset_stats(self) -> Dict[str, Any]:
+        rows = 0
+        pos = 0
+        neg = 0
+        if not os.path.exists(self.dataset_path):
+            return {"rows": 0, "pos": 0, "neg": 0, "pos_rate": 0.0}
+        try:
+            with open(self.dataset_path, "r", encoding="utf-8") as f:
+                r = csv.reader(f)
+                _ = next(r, None)
+                for row in r:
+                    if len(row) < 3:
+                        continue
+                    rows += 1
+                    y = int(float(row[2]))
+                    if y == 1:
+                        pos += 1
+                    else:
+                        neg += 1
+        except Exception:
+            return {"rows": 0, "pos": 0, "neg": 0, "pos_rate": 0.0}
+        return {"rows": rows, "pos": pos, "neg": neg, "pos_rate": (float(pos) / max(1, rows))}

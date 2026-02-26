@@ -23,6 +23,18 @@ def fmt_ts(ts_ms: Any) -> str:
     except Exception:
         return ""
 
+
+
+def write_cmd(cfg: Dict[str, Any], cmd: str, **kwargs) -> None:
+    """Write UI command to data/ui_commands.jsonl for hub cmd_loop consumption."""
+    data_dir = ROOT / "data"
+    data_dir.mkdir(exist_ok=True)
+    fp = data_dir / "ui_commands.jsonl"
+    payload = {"id": int(time.time()*1000), "ts": int(time.time()*1000), "cmd": cmd}
+    payload.update(kwargs)
+    with fp.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
 class WSClient(QtCore.QThread):
     message = Signal(dict)
     status = Signal(str)
@@ -418,7 +430,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"auc={float(modelb_status.get('auc',0.0)):.3f} | acc={float(modelb_status.get('acc',0.0)):.3f}"
             )
             self.lbl_mlops.setText(
-                f"MLOps: dataset_rows={int(modelb_status.get('dataset_rows',0))}, training_disabled={bool(modelb_status.get('training_disabled',False))}"
+                f"MLOps: dataset_rows={int(modelb_status.get('dataset_rows',0))}, training_disabled={bool(modelb_status.get('training_disabled',False))}, "
+                f"progress={float(modelb_status.get('training_progress',0.0)):.0%}, reason={modelb_status.get('last_retrain_reason','n/a')}"
             )
         else:
             self.lbl_modelb.setText("Model-B: нет событий MODEL_B_STATUS / MODEL_B_INFERRED")
@@ -429,8 +442,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 ds_path = str((e.get("payload") or {}).get("dataset_path", ""))
                 break
         rows_val = int(dataset_rows or 0)
-        self.lbl_ds.setText(f"Dataset: {rows_val} rows")
-        self.tbl_ds.set_rows([[rows_val, "—", fmt_ts(self.events[-1].get("ts") if self.events else 0), ds_path]])
+        pos_rate = float((modelb_status or {}).get("dataset_pos_rate", 0.0) or 0.0)
+        self.lbl_ds.setText(f"Dataset: {rows_val} rows | positive_rate={pos_rate:.2%}")
+        self.tbl_ds.set_rows([[rows_val, f"{pos_rate:.2%}", fmt_ts(self.events[-1].get("ts") if self.events else 0), ds_path]])
 
         mh=self.model_health or {}
         self.m_samples.setText(f"Samples: {int(mh.get('samples',0))}")
@@ -490,6 +504,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _tab_modelb(self):
         w=QWidget(); lay=QVBoxLayout(w)
+        info=QLabel("Model-B (вторая модель): Prob(head)=вероятность от обучаемой головы, Prob(backbone)=вероятность backbone, Decision=пороговый фильтр сигнала.")
+        info.setWordWrap(True); lay.addWidget(info)
         self.lbl_modelb=QLabel("Model-B: нет данных"); lay.addWidget(self.lbl_modelb)
         btns=QHBoxLayout()
         b1=QPushButton("Force retrain"); b1.clicked.connect(lambda: write_cmd(self.cfg, "force_model_b_retrain"))
@@ -504,6 +520,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _tab_dataset(self):
         w=QWidget(); lay=QVBoxLayout(w)
+        info=QLabel("Dataset: строки обучающих примеров для Model-B. Label1% показывает долю позитивного класса (рост после горизонта).")
+        info.setWordWrap(True); lay.addWidget(info)
         self.lbl_ds=QLabel("Dataset: 0 rows"); lay.addWidget(self.lbl_ds)
         self.tbl_ds=SimpleTable(["Rows","Label1%","Last ts","Path"])
         lay.addWidget(self.tbl_ds)
@@ -511,6 +529,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _tab_mlops(self):
         w=QWidget(); lay=QVBoxLayout(w)
+        info=QLabel("MLOps: метрики переобучения Model-B. AUC/PR_AUC/ACC — качество, Samples — объём train/val, Promoted — принята ли новая версия.")
+        info.setWordWrap(True); lay.addWidget(info)
         self.lbl_mlops=QLabel("MLOps: нет retrain"); lay.addWidget(self.lbl_mlops)
         self.tbl_mlops=SimpleTable(["Time","AUC","PR_AUC","ACC","Samples","Promoted"])
         lay.addWidget(self.tbl_mlops)
@@ -518,6 +538,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _tab_levels(self):
         w=QWidget(); lay=QVBoxLayout(w)
+        info=QLabel("Levels/OB: параметры стакана. imb=дисбаланс объёма BID/ASK, spread_bps=спред в bps, wall_age=возраст стенки, touches=касания, dist_bps=дистанция до стенки.")
+        info.setWordWrap(True); lay.addWidget(info)
         self.tbl_levels=SimpleTable(["Time","Symbol","imb","spread_bps","wall_age","touches","dist_bps"])
         lay.addWidget(self.tbl_levels)
         self.tabs.addTab(w, "Levels/OB")

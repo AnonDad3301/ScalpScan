@@ -195,15 +195,37 @@ class Engine:
 
                 # Model-B shadow inference + dataset shadow label
                 try:
+                    closes = np.array([row[4] for row in ohlcv], dtype=float) if ohlcv else np.array([], dtype=float)
+                    ret_last = float((closes[-1]-closes[-2]) / max(1e-12, closes[-2])) if len(closes) >= 2 else 0.0
+                    range_last = float((ohlcv[-1][2]-ohlcv[-1][3]) / max(1e-12, ohlcv[-1][4])) if ohlcv else 0.0
+                    ret_hist = np.diff(closes) / np.maximum(1e-12, closes[:-1]) if len(closes) >= 3 else np.array([], dtype=float)
+                    vol_z_last = 0.0
+                    if len(ret_hist) >= 10:
+                        mu = float(np.mean(ret_hist[-10:]))
+                        sd = float(np.std(ret_hist[-10:]))
+                        vol_z_last = float((ret_last - mu) / max(1e-12, sd))
+                    ctx = market_ctx.get(sym, {})
+                    bid_wall = float(ctx.get("bid_wall", 0.0) or 0.0)
+                    ask_wall = float(ctx.get("ask_wall", 0.0) or 0.0)
+                    wall_dist = 0.0
+                    wall_age = 0.0
+                    modelb_side = "LONG" if float(mout.get("pred", 0.0)) >= 0 else "SHORT"
+                    if bid_wall > 0.0 and ask_wall > 0.0:
+                        if modelb_side == "LONG":
+                            wall_dist = abs(ask_wall - last_close) / max(1e-12, last_close) * 10000.0
+                            wall_age = float(ctx.get("ask_wall_age", 0.0) or 0.0)
+                        else:
+                            wall_dist = abs(last_close - bid_wall) / max(1e-12, last_close) * 10000.0
+                            wall_age = float(ctx.get("bid_wall_age", 0.0) or 0.0)
                     model_b_feats={
-                        "ret_last": float(gate.get("ret_last",0.0) if isinstance(gate,dict) else 0.0),
-                        "range_last": float(gate.get("range_last",0.0) if isinstance(gate,dict) else 0.0),
-                        "vol_z_last": float(gate.get("vol_z_last",0.0) if isinstance(gate,dict) else 0.0),
-                        "imb": float(gate.get("imb",0.0) if isinstance(gate,dict) else 0.0),
-                        "spread_bps": float(gate.get("spread_bps",0.0) if isinstance(gate,dict) else 0.0),
-                        "wall_dist_bps": float(gate.get("wall_dist_bps",0.0) if isinstance(gate,dict) else 0.0),
-                        "wall_age": float(gate.get("wall_age",0.0) if isinstance(gate,dict) else 0.0),
-                        "wall_touches": float(gate.get("wall_touches",0.0) if isinstance(gate,dict) else 0.0),
+                        "ret_last": ret_last,
+                        "range_last": range_last,
+                        "vol_z_last": vol_z_last,
+                        "imb": float(ctx.get("imbalance", ob.get("imbalance", 0.0)) or 0.0),
+                        "spread_bps": float(ctx.get("spread", ob.get("spread", 0.0)) or 0.0),
+                        "wall_dist_bps": float(wall_dist),
+                        "wall_age": float(wall_age),
+                        "wall_touches": float(1.0 if wall_dist > 0.0 else 0.0),
                     }
                     prob=self.model_b_trainer.infer_prob(model_b_feats)
                     thr=float(self.cfg.get("model_b",{}).get("model_b_prob_min",0.55))
@@ -254,11 +276,16 @@ class Engine:
             else:
                 st = self.ds_builder.stats() if hasattr(self, "ds_builder") else {}
                 cooldown_left_ms = max(0, int(getattr(self.model_b_trainer, "retrain_ms", 0) - (now_ms() - int(getattr(self.model_b_trainer, "last_train_ms", 0)))))
+                ds_stats = self.model_b_trainer.dataset_stats() if hasattr(self, 'model_b_trainer') else {}
                 self.es.append(mk_event(base, "MODEL_B_RETRAIN_SKIPPED", "INFO", {
                     "rows": st.get("rows", 0),
                     "need_rows": 200,
                     "cooldown_left_ms": cooldown_left_ms,
                     "training_disabled": bool(disable_b),
+                    "last_reason": getattr(self.model_b_trainer, 'last_retrain_reason', 'unknown'),
+                    "dataset_pos": ds_stats.get('pos', 0),
+                    "dataset_neg": ds_stats.get('neg', 0),
+                    "dataset_pos_rate": ds_stats.get('pos_rate', 0.0),
                 }))
         except Exception as e:
             self.es.append(mk_event(base, "ERROR", "ERROR", {"where": "MODEL_B_RETRAIN", "err": str(e)}))
@@ -319,12 +346,19 @@ class Engine:
         # Model-B status heartbeat
         try:
             st = self.ds_builder.stats() if hasattr(self,'ds_builder') else {}
+            ds_stats = self.model_b_trainer.dataset_stats() if hasattr(self, 'model_b_trainer') else {}
             m = getattr(self.model_b_trainer, 'last_metrics', None)
+            progress = min(1.0, float(ds_stats.get('rows', 0)) / 400.0)
             mp = {
                 'dataset_rows': st.get('rows',0),
                 'pending': st.get('pending',0),
                 'dataset_path': st.get('path',''),
                 'training_disabled': bool(disable_b),
+                'dataset_pos': ds_stats.get('pos', 0),
+                'dataset_neg': ds_stats.get('neg', 0),
+                'dataset_pos_rate': ds_stats.get('pos_rate', 0.0),
+                'training_progress': progress,
+                'last_retrain_reason': getattr(self.model_b_trainer, 'last_retrain_reason', 'unknown'),
             }
             if m is not None:
                 mp.update({'auc': getattr(m,'auc',0.0), 'pr_auc': getattr(m,'pr_auc',0.0), 'acc': getattr(m,'acc',0.0), 'samples': getattr(m,'samples',0)})
