@@ -168,9 +168,18 @@ class Engine:
                 arr=np.array([c for _,_,_,_,c,_ in ohlcv], dtype=float)
                 pattern = self.pattern_scanner.scan(ohlcv)
                 regime = self.regime_detector.detect(arr)
+                regime_name_raw = str(getattr(regime, "name", "unknown"))
+                regime_name = "mean_reversion" if regime_name_raw == "calm" else ("high_volatility" if regime_name_raw == "volatile" else regime_name_raw)
+                # liquidity gate proxy: extreme spread percentile or sparse L2
+                bid_n = len(ob.get("bids") or [])
+                ask_n = len(ob.get("asks") or [])
+                if float(feats.get("spread_pct_rank", 0.0)) > 0.98 or min(bid_n, ask_n) < 3:
+                    regime_name = "low_liquidity"
                 forecast = self.forecaster.predict(arr)
                 self.es.append(mk_event(env, "MARKET_PATTERN_SCAN", "INFO", pattern.as_dict()))
-                self.es.append(mk_event(env, "REGIME_DETECTED", "INFO", regime.as_dict()))
+                reg_payload = regime.as_dict()
+                reg_payload["name"] = regime_name
+                self.es.append(mk_event(env, "REGIME_DETECTED", "INFO", reg_payload))
                 self.es.append(mk_event(env, "MULTI_HORIZON_FORECAST", "INFO", {"forecast": forecast}))
                 f3 = forecast.get("m3", {}) if isinstance(forecast, dict) else {}
                 f5 = forecast.get("m5", {}) if isinstance(forecast, dict) else {}
@@ -202,7 +211,13 @@ class Engine:
                 feats["forecast_ret"] = forecast_ret
                 feats["rr_ratio"] = float(rr_ratio)
                 feats["trend_strength"] = float(trend_strength)
-                feats["regime"] = str(getattr(regime, "regime", "unknown"))
+                feats["regime"] = regime_name
+                st_live = self.portfolio.stats()
+                win_rate = float(st_live.get("win_rate", 0.5))
+                sl_rate = float(st_live.get("sl", 0)) / max(1.0, float(st_live.get("total_closed", 0)))
+                feats["win_rate"] = win_rate
+                feats["sl_rate"] = sl_rate
+                feats["latency_ms"] = float(getattr(self.market, "last_latency_ms", 0.0) or 0.0)
                 fees_bps = float(self.cfg.get("execution", {}).get("fees_bps", 0.0)) + float(self.cfg.get("execution", {}).get("slippage_bps", 0.0))
                 feats["costs_bps"] = fees_bps
                 feats["tp_return"] = float(abs((feats.get("tp1", last_close) - last_close) / max(1e-12, last_close))) if feats.get("tp1") is not None else 0.0
@@ -312,7 +327,6 @@ class Engine:
                 except Exception as e:
                     self.es.append(mk_event(env,"ERROR","ERROR",{"where":"MODEL_B_SHADOW","err":str(e)}))
 
-                regime_name = str(getattr(regime, "regime", "unknown"))
                 model_b_prob = float(locals().get("prob", 0.5))
                 ensemble_cfg = ((self.cfg.get("model", {}) or {}).get("ensemble", {}) or {})
                 ens = meta_decide(
@@ -346,6 +360,14 @@ class Engine:
                     "p_sl_first": ens_d.get("p_sl_first", 0.5),
                     "market_regime": feats.get("regime"),
                     "decision_reasons": gate.get("reasons", [])[:3],
+                    "ev": float(gate.get("expected_value", 0.0)),
+                    "top_features": sorted([
+                        ("ob_imb_l1", abs(float(feats.get("ob_imb_l1",0.0)))),
+                        ("microprice_delta_bps", abs(float(feats.get("microprice_delta_bps",0.0)))),
+                        ("vwap_dist", abs(float(feats.get("vwap_dist",0.0)))),
+                        ("atr_percentile", abs(float(feats.get("atr_percentile",0.0)))),
+                        ("trend_strength", abs(float(feats.get("trend_strength",0.0)))),
+                    ], key=lambda x: x[1], reverse=True)[:3],
                     "gate":gate,
                     "entry": last_close, "sl": feats.get("sl"), "tp1": feats.get("tp1"), "tp2": feats.get("tp2")
                 }))

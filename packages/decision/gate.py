@@ -16,6 +16,9 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
     ev_min = float(prof.get("ev_min", 0.0))
     high_vol_conf_boost = float(prof.get("high_vol_conf_boost", 0.08))
     cooldown_after_sl = int(prof.get("cooldown_after_sl", 3))
+    spread_rank_max = float(prof.get("spread_rank_max", 0.95))
+    latency_ms_max = float(prof.get("latency_ms_max", 1200.0))
+    high_conf_min = float(prof.get("high_confidence_min", 0.7))
 
     rules = []
     reasons = []
@@ -45,9 +48,20 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
         else:
             add("MODEL_AUC_MIN", auc_ok, auc, min_auc)
 
+    win_rate = float(features.get("win_rate", 0.5))
+    sl_rate = float(features.get("sl_rate", 0.0))
+    if sl_rate > 0.55:
+        conf_min = min(0.99, conf_min + 0.05)
+        rr_min += 0.10
+    elif win_rate > 0.62:
+        conf_min = max(0.50, conf_min - 0.02)
+
     regime = str(features.get("regime", "unknown"))
     if regime == "high_volatility":
         conf_min = min(0.99, conf_min + high_vol_conf_boost)
+        rr_min += 0.1
+    if regime == "mean_reversion":
+        rr_min = max(0.6, rr_min - 0.15)
     add("CONFIDENCE_MIN", conf >= conf_min, conf, conf_min)
 
     pred = float(model_out.get("pred", 0.0))
@@ -58,6 +72,12 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
 
     spread_bps = float(features.get("spread_bps", features.get("spread", 0.0)))
     add("SPREAD_MAX", spread_bps <= spread_max, spread_bps, spread_max)
+
+    spread_rank = float(features.get("spread_pct_rank", 0.0))
+    add("SPREAD_RANK_MAX", spread_rank <= spread_rank_max, spread_rank, spread_rank_max)
+
+    latency_ms = float(features.get("latency_ms", 0.0))
+    add("LATENCY_MS_MAX", latency_ms <= latency_ms_max, latency_ms, latency_ms_max)
 
     volz = float(features.get("volz", abs(features.get("vol_z_last", 0.0))))
     add("VOLZ_MAX", volz <= volz_max, volz, volz_max)
@@ -87,6 +107,9 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
 
     sl_streak = int(features.get("sl_streak", 0))
     add("COOLDOWN_AFTER_SL", sl_streak < cooldown_after_sl, sl_streak, cooldown_after_sl)
+
+    high_conf = float(model_out.get("confidence", 0.0)) >= high_conf_min
+    add("HIGH_CONFIDENCE", high_conf, float(model_out.get("confidence", 0.0)), high_conf_min)
 
     decision = "PASS" if all(r["pass"] for r in rules) else "FAIL"
     return {

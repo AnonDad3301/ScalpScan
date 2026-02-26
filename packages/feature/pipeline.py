@@ -11,6 +11,37 @@ def _safe_pct_rank(x: np.ndarray) -> float:
     return float(np.mean(x <= cur))
 
 
+
+
+def _hurst_exponent(x: np.ndarray) -> float:
+    arr = np.asarray(x, dtype=float)
+    if arr.size < 20:
+        return 0.5
+    lags = np.array([2, 4, 8, 16], dtype=int)
+    tau = []
+    for lag in lags:
+        if lag >= arr.size:
+            continue
+        diff = arr[lag:] - arr[:-lag]
+        tau.append(float(np.std(diff)))
+    if len(tau) < 2:
+        return 0.5
+    poly = np.polyfit(np.log(lags[:len(tau)]), np.log(np.maximum(1e-12, tau)), 1)
+    return float(max(0.0, min(1.0, poly[0])))
+
+
+def _lob_slope(levels, side: str) -> float:
+    if not levels:
+        return 0.0
+    px = np.array([float(x[0]) for x in levels[:10] if len(x) >= 2], dtype=float)
+    sz = np.array([float(x[1]) for x in levels[:10] if len(x) >= 2], dtype=float)
+    if px.size < 2:
+        return 0.0
+    y = np.log(np.maximum(1e-9, sz))
+    x = np.arange(px.size, dtype=float)
+    slope = np.polyfit(x, y, 1)[0]
+    return float(slope if side == "bid" else -slope)
+
 def compute(ohlcv: List[Tuple[int, float, float, float, float, float]], ob: Dict[str, Any]) -> Dict[str, float]:
     arr = np.array([[o, h, l, c, v] for _, o, h, l, c, v in ohlcv], dtype=float)
     high = arr[:, 1]
@@ -46,6 +77,7 @@ def compute(ohlcv: List[Tuple[int, float, float, float, float, float]], ob: Dict
     wick_asym = float((up_wick - low_wick) / max(1e-12, abs(body) + up_wick + low_wick))
 
     realized_vol = float(np.std(rets[-30:])) if len(rets) >= 5 else 0.0
+    hurst = _hurst_exponent(np.log(np.maximum(1e-12, close))) if len(close) else 0.5
     entropy = 0.0
     if len(rets) >= 20:
         bins = np.histogram(rets[-60:], bins=10)[0].astype(float)
@@ -69,6 +101,11 @@ def compute(ohlcv: List[Tuple[int, float, float, float, float, float]], ob: Dict
     best_ask = float(asks[0][0]) if asks else (last + spread_raw / 2.0)
     microprice = float((best_ask * max(1e-12, (1 + l1_imb)) + best_bid * max(1e-12, (1 - l1_imb))) / 2.0)
     microprice_delta_bps = float((microprice - last) / max(1e-12, last) * 10000.0)
+    lob_slope_bid = _lob_slope(bids, "bid")
+    lob_slope_ask = _lob_slope(asks, "ask")
+    queue_imbalance_dynamics = float(ob.get("queue_imbalance_dynamics", l1_imb - l5_imb))
+    volume_delta = float(ob.get("volume_delta", ret_last * float(vol[-1] if len(vol) else 0.0)))
+    volume_imbalance = float(ob.get("volume_imbalance", (volume_delta / max(1e-12, abs(volume_delta) + float(vol[-1] if len(vol) else 1.0)))))
 
     return {
         "rsi": rsi(close, 14),
@@ -85,6 +122,11 @@ def compute(ohlcv: List[Tuple[int, float, float, float, float, float]], ob: Dict
         "wall_persistence": float(ob.get("wall_persistence", 0.0) or 0.0),
         "cancel_add_ratio": float(ob.get("cancel_add_ratio", 0.0) or 0.0),
         "orderflow_delta": float(ob.get("orderflow_delta", 0.0) or 0.0),
+        "lob_slope_bid": lob_slope_bid,
+        "lob_slope_ask": lob_slope_ask,
+        "queue_imbalance_dynamics": queue_imbalance_dynamics,
+        "volume_delta": volume_delta,
+        "volume_imbalance": volume_imbalance,
         "ret_last": ret_last,
         "range_last": range_last,
         "vol_z_last": vol_z_last,
@@ -95,4 +137,5 @@ def compute(ohlcv: List[Tuple[int, float, float, float, float, float]], ob: Dict
         "wick_asymmetry": wick_asym,
         "realized_vol": realized_vol,
         "entropy_returns": entropy,
+        "hurst": hurst,
     }

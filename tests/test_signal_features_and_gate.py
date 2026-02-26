@@ -39,6 +39,8 @@ class SignalFeatureGateTests(unittest.TestCase):
             "sl_return": 0.006,
             "costs_bps": 3.0,
             "sl_streak": 0,
+            "spread_pct_rank": 0.2,
+            "latency_ms": 200,
         }
         out = decide(
             features,
@@ -57,6 +59,7 @@ class SignalFeatureGateTests(unittest.TestCase):
                         "uncertainty_max": 0.02,
                         "rr_min": 1.2,
                         "trend_strength_min": 0.05,
+                        "high_confidence_min": 0.70,
                     }
                 },
                 "min_samples": 50,
@@ -67,6 +70,7 @@ class SignalFeatureGateTests(unittest.TestCase):
         self.assertEqual(out["decision"], "PASS")
         self.assertIn("forecast_uncertainty", out)
         self.assertIn("rr_ratio", out)
+        self.assertGreater(out.get("expected_value", -1), 0.0)
 
     def test_gate_auc_override_by_high_confidence(self):
         features = {
@@ -81,6 +85,8 @@ class SignalFeatureGateTests(unittest.TestCase):
             "sl_return": 0.005,
             "costs_bps": 3.0,
             "sl_streak": 0,
+            "spread_pct_rank": 0.2,
+            "latency_ms": 200,
         }
         out = decide(
             features,
@@ -99,6 +105,7 @@ class SignalFeatureGateTests(unittest.TestCase):
                         "uncertainty_max": 0.02,
                         "rr_min": 0.9,
                         "trend_strength_min": 0.05,
+                        "high_confidence_min": 0.70,
                     }
                 },
                 "min_samples": 50,
@@ -108,6 +115,27 @@ class SignalFeatureGateTests(unittest.TestCase):
             },
         )
         self.assertEqual(out["decision"], "PASS")
+
+
+    def test_gate_blocks_extreme_spread_window(self):
+        features = {
+            "adx": 25, "spread_bps": 3, "spread_pct_rank": 0.99, "latency_ms": 1500,
+            "volz": 0.3, "forecast_uncertainty": 0.004, "rr_ratio": 1.3, "trend_strength": 0.3,
+            "regime": "trend", "tp_return": 0.01, "sl_return": 0.005, "costs_bps": 3.0, "sl_streak": 0,
+        }
+        out = decide(
+            features,
+            inv_results=[{"pass": True}],
+            model_out={"confidence": 0.85, "pred": 0.2, "p_tp_first": 0.65, "model_a_direction": "LONG", "model_b_direction": "LONG"},
+            model_health={"samples": 800, "auc": 0.6},
+            cfg={
+                "profile": "scalp",
+                "profiles": {"scalp": {"entry_threshold": 0.06, "confidence_min": 0.52, "adx_min": 8, "spread_max": 20, "volz_max": 3.5, "uncertainty_max": 0.02, "rr_min": 0.9, "trend_strength_min": 0.05}},
+                "min_samples": 50, "auc_warmup_samples": 600, "min_auc": 0.52,
+            },
+        )
+        self.assertEqual(out["decision"], "FAIL")
+        self.assertIn("SPREAD_RANK_MAX", out["reasons"])
 
 
 if __name__ == "__main__":
