@@ -111,6 +111,7 @@ class Engine:
         self.es.append(mk_event(base,"UNIVERSE_SELECTED","INFO",{"selected_n":len(symbols),"selected":symbols[:1000]}))
 
         prices: Dict[str, float] = {}
+        market_ctx: Dict[str, Dict[str, Any]] = {}
 
         for sym in symbols:
             env=dict(base); env["symbol"]=sym
@@ -136,6 +137,24 @@ class Engine:
                 }))
 
                 feats=compute_features(ohlcv, ob)
+                try:
+                    self.ob_tracker.update(sym, ob, last_close)
+                    walls = self.ob_tracker.strongest_walls(sym, last_close, topk=3)
+                    bid_wall = next((w for w in walls if w.side == "BID"), None)
+                    ask_wall = next((w for w in walls if w.side == "ASK"), None)
+                    market_ctx[sym] = {
+                        "imbalance": float(ob.get("imbalance", 0.0) or 0.0),
+                        "spread": float(ob.get("spread", 0.0) or 0.0),
+                        "bid_wall": float(bid_wall.price) if bid_wall else 0.0,
+                        "ask_wall": float(ask_wall.price) if ask_wall else 0.0,
+                        "bid_wall_age": float(bid_wall.age_sec) if bid_wall else 0.0,
+                        "ask_wall_age": float(ask_wall.age_sec) if ask_wall else 0.0,
+                    }
+                except Exception:
+                    market_ctx[sym] = {
+                        "imbalance": float(ob.get("imbalance", 0.0) or 0.0),
+                        "spread": float(ob.get("spread", 0.0) or 0.0),
+                    }
                 inv=inv_check(feats, self.cfg["features"]["invariants"])
                 self.es.append(mk_event(env,"FEATURES_COMPUTED","INFO",{"features":feats,"invariants":inv}))
                 if not inv_ok(inv):
@@ -197,6 +216,7 @@ class Engine:
                         ret=(c1-c0)/max(1e-12,c0)
                         self.ds_builder.append_shadow(int(time.time()*1000), sym, int(ohlcv[-2][0]) if len(ohlcv)>1 else 0,
                                                      int(time.time()*1000), price_source, "bybit.linear.swap", model_b_feats, ret)
+                        self.es.append(mk_event(env, "MODEL_B_DATASET_APPEND", "INFO", {"symbol": sym, "rows": self.ds_builder.stats().get("rows", 0), "ret": ret, "label": 1 if ret > 0 else 0}))
                 except Exception as e:
                     self.es.append(mk_event(env,"ERROR","ERROR",{"where":"MODEL_B_SHADOW","err":str(e)}))
 
@@ -231,6 +251,15 @@ class Engine:
                     "samples": getattr(mB,"samples",0),
                     "promoted": bool(promoted)
                 }))
+            else:
+                st = self.ds_builder.stats() if hasattr(self, "ds_builder") else {}
+                cooldown_left_ms = max(0, int(getattr(self.model_b_trainer, "retrain_ms", 0) - (now_ms() - int(getattr(self.model_b_trainer, "last_train_ms", 0)))))
+                self.es.append(mk_event(base, "MODEL_B_RETRAIN_SKIPPED", "INFO", {
+                    "rows": st.get("rows", 0),
+                    "need_rows": 200,
+                    "cooldown_left_ms": cooldown_left_ms,
+                    "training_disabled": bool(disable_b),
+                }))
         except Exception as e:
             self.es.append(mk_event(base, "ERROR", "ERROR", {"where": "MODEL_B_RETRAIN", "err": str(e)}))
 
@@ -261,7 +290,7 @@ class Engine:
 
         # manage open positions (exit manager)
         try:
-            updates, closed = self.portfolio.manage_positions(now_ms(), prices)
+            updates, closed = self.portfolio.manage_positions(now_ms(), prices, market_ctx=market_ctx)
             for u in updates:
                 self.es.append(mk_event(base, "POSITION_UPDATE", "INFO", u))
             for c in closed:
@@ -305,4 +334,3 @@ class Engine:
 
 
         return run_id
-
