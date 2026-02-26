@@ -426,15 +426,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if modelb_status:
             self.lbl_modelb.setText(
-                f"Model-B: rows={int(modelb_status.get('dataset_rows',0))} | pending={int(modelb_status.get('pending',0))} | "
+                f"Model-B: строк={int(modelb_status.get('dataset_rows',0))} | pending={int(modelb_status.get('pending',0))} | "
                 f"auc={float(modelb_status.get('auc',0.0)):.3f} | acc={float(modelb_status.get('acc',0.0)):.3f}"
             )
+            self.pb_modelb.setValue(int(max(0,min(100, round(float(modelb_status.get('training_progress',0.0))*100)))))
             self.lbl_mlops.setText(
                 f"MLOps: dataset_rows={int(modelb_status.get('dataset_rows',0))}, training_disabled={bool(modelb_status.get('training_disabled',False))}, "
                 f"progress={float(modelb_status.get('training_progress',0.0)):.0%}, reason={modelb_status.get('last_retrain_reason','n/a')}"
             )
+            self.pb_auc.setValue(int(max(0,min(100, round(float(modelb_status.get('auc',0.0))*100)))))
         else:
             self.lbl_modelb.setText("Model-B: нет событий MODEL_B_STATUS / MODEL_B_INFERRED")
+            self.pb_modelb.setValue(0)
+            self.pb_auc.setValue(0)
 
         ds_path = ""
         for e in reversed(self.events[-2000:]):
@@ -444,7 +448,12 @@ class MainWindow(QtWidgets.QMainWindow):
         rows_val = int(dataset_rows or 0)
         pos_rate = float((modelb_status or {}).get("dataset_pos_rate", 0.0) or 0.0)
         self.lbl_ds.setText(f"Dataset: {rows_val} rows | positive_rate={pos_rate:.2%}")
-        self.tbl_ds.set_rows([[rows_val, f"{pos_rate:.2%}", fmt_ts(self.events[-1].get("ts") if self.events else 0), ds_path]])
+        last_ds_ts = ""
+        for e in reversed(self.events[-2000:]):
+            if e.get("stage") == "MODEL_B_DATASET_APPEND":
+                last_ds_ts = fmt_ts(e.get("ts"))
+                break
+        self.tbl_ds.set_rows([[rows_val, f"{pos_rate:.2%}", last_ds_ts or fmt_ts(self.events[-1].get("ts") if self.events else 0), ds_path]])
 
         mh=self.model_health or {}
         self.m_samples.setText(f"Samples: {int(mh.get('samples',0))}")
@@ -507,6 +516,8 @@ class MainWindow(QtWidgets.QMainWindow):
         info=QLabel("Model-B (вторая модель): Prob(head)=вероятность от обучаемой головы, Prob(backbone)=вероятность backbone, Decision=пороговый фильтр сигнала.")
         info.setWordWrap(True); lay.addWidget(info)
         self.lbl_modelb=QLabel("Model-B: нет данных"); lay.addWidget(self.lbl_modelb)
+        self.pb_modelb=QtWidgets.QProgressBar(); self.pb_modelb.setRange(0,100); self.pb_modelb.setValue(0); self.pb_modelb.setFormat("Готовность Model-B: %p%")
+        lay.addWidget(self.pb_modelb)
         btns=QHBoxLayout()
         b1=QPushButton("Force retrain"); b1.clicked.connect(lambda: write_cmd(self.cfg, "force_model_b_retrain"))
         b2=QPushButton("Disable training"); b2.clicked.connect(lambda: write_cmd(self.cfg, "disable_model_b_training"))
@@ -532,6 +543,8 @@ class MainWindow(QtWidgets.QMainWindow):
         info=QLabel("MLOps: метрики переобучения Model-B. AUC/PR_AUC/ACC — качество, Samples — объём train/val, Promoted — принята ли новая версия.")
         info.setWordWrap(True); lay.addWidget(info)
         self.lbl_mlops=QLabel("MLOps: нет retrain"); lay.addWidget(self.lbl_mlops)
+        self.pb_auc=QtWidgets.QProgressBar(); self.pb_auc.setRange(0,100); self.pb_auc.setValue(0); self.pb_auc.setFormat("AUC: %p%")
+        lay.addWidget(self.pb_auc)
         self.tbl_mlops=SimpleTable(["Time","AUC","PR_AUC","ACC","Samples","Promoted"])
         lay.addWidget(self.tbl_mlops)
         self.tabs.addTab(w, "MLOps")

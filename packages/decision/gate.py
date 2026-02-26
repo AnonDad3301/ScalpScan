@@ -8,8 +8,11 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
     entry_th = float(prof.get("entry_threshold", 0.06))
     conf_min = float(prof.get("confidence_min", 0.52))
     adx_min = float(prof.get("adx_min", 8))
-    spread_max = float(prof.get("spread_max", 1.5))
+    spread_max = float(prof.get("spread_max", 12.0))
     volz_max = float(prof.get("volz_max", 3.5))
+    uncertainty_max = float(prof.get("uncertainty_max", 0.02))
+    rr_min = float(prof.get("rr_min", 1.2))
+    trend_strength_min = float(prof.get("trend_strength_min", 0.05))
 
     rules = []
     reasons = []
@@ -25,7 +28,6 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
     min_samples = int(cfg.get("min_samples", 50))
     add("MODEL_SAMPLES_MIN", samples >= min_samples, samples, min_samples)
 
-    # AUC warmup: don't block signals until enough samples
     auc = float(model_health.get("auc", 0.0))
     warmup = int(cfg.get("auc_warmup_samples", 600))
     min_auc = float(cfg.get("min_auc", 0.52))
@@ -43,11 +45,36 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
     adx = float(features.get("adx", 0.0))
     add("ADX_MIN", adx >= adx_min, adx, adx_min)
 
-    spread = float(features.get("spread_bps", 0.0))
-    add("SPREAD_MAX", spread <= spread_max, spread, spread_max)
+    spread_bps = float(features.get("spread_bps", features.get("spread", 0.0)))
+    add("SPREAD_MAX", spread_bps <= spread_max, spread_bps, spread_max)
 
-    volz = float(features.get("volz", 0.0))
+    volz = float(features.get("volz", abs(features.get("vol_z_last", 0.0))))
     add("VOLZ_MAX", volz <= volz_max, volz, volz_max)
 
+    unc = float(features.get("forecast_uncertainty", 1.0))
+    add("UNCERTAINTY_MAX", unc <= uncertainty_max, unc, uncertainty_max)
+
+    rr = float(features.get("rr_ratio", 0.0))
+    add("RR_MIN", rr >= rr_min, rr, rr_min)
+
+    trend_strength = float(features.get("trend_strength", 0.0))
+    add("TREND_STRENGTH_MIN", trend_strength >= trend_strength_min, trend_strength, trend_strength_min)
+
     decision = "PASS" if all(r["pass"] for r in rules) else "FAIL"
-    return {"decision": decision, "rules": rules, "reasons": reasons}
+    return {
+        "decision": decision,
+        "rules": rules,
+        "reasons": reasons,
+        "spread_bps": spread_bps,
+        "volz": volz,
+        "ret_last": float(features.get("ret_last", 0.0)),
+        "range_last": float(features.get("range_last", 0.0)),
+        "vol_z_last": float(features.get("vol_z_last", 0.0)),
+        "imb": float(features.get("ob_imb", 0.0)),
+        "wall_dist_bps": float(features.get("wall_dist_bps", 0.0)),
+        "wall_age": float(features.get("wall_age", 0.0)),
+        "wall_touches": float(features.get("wall_touches", 0.0)),
+        "forecast_uncertainty": unc,
+        "rr_ratio": rr,
+        "trend_strength": trend_strength,
+    }

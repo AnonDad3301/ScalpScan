@@ -53,8 +53,11 @@ gate:
       entry_threshold: 0.06
       confidence_min: 0.52
       adx_min: 8
-      spread_max: 1.5
+      spread_max: 12.0
       volz_max: 3.5
+      uncertainty_max: 0.02
+      rr_min: 1.2
+      trend_strength_min: 0.05
 execution:
   deposit_usd: 2000
   risk_usd: 50

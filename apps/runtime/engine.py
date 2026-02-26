@@ -168,6 +168,37 @@ class Engine:
                 self.es.append(mk_event(env, "MARKET_PATTERN_SCAN", "INFO", pattern.as_dict()))
                 self.es.append(mk_event(env, "REGIME_DETECTED", "INFO", regime.as_dict()))
                 self.es.append(mk_event(env, "MULTI_HORIZON_FORECAST", "INFO", {"forecast": forecast}))
+
+                # enrich features for gate + model-b observability
+                f1 = forecast.get("m1", {}) if isinstance(forecast, dict) else {}
+                forecast_ret = float(f1.get("ret", 0.0) or 0.0)
+                forecast_unc = float(f1.get("uncertainty", 1.0) or 1.0)
+                rr_ratio = abs(float(pattern.breakout_strength)) / max(1e-9, float(feats.get("atr", 0.0))) if hasattr(pattern, 'breakout_strength') else 0.0
+                trend_strength = abs(float(feats.get("adx", 0.0))) / 100.0
+                feats["forecast_uncertainty"] = forecast_unc
+                feats["forecast_ret"] = forecast_ret
+                feats["rr_ratio"] = float(rr_ratio)
+                feats["trend_strength"] = float(trend_strength)
+
+                try:
+                    walls = self.ob_tracker.strongest_walls(sym, last_close, topk=3)
+                    if walls:
+                        w = walls[0]
+                        feats["wall_dist_bps"] = float(w.dist_bps)
+                        feats["wall_age"] = float(w.age_sec)
+                        feats["wall_touches"] = float(w.touch_count)
+                except Exception:
+                    pass
+
+                self.es.append(mk_event(env, "FEATURES_SNAPSHOT", "INFO", {"features": feats}))
+                if float(feats.get("rr_ratio",0.0)) >= 1.0 and float(feats.get("forecast_uncertainty",1.0)) <= 0.05:
+                    self.es.append(mk_event(env, "SETUP_EVENT", "INFO", {
+                        "type": "QUALITY_SETUP",
+                        "rr_ratio": feats.get("rr_ratio"),
+                        "forecast_uncertainty": feats.get("forecast_uncertainty"),
+                        "trend_strength": feats.get("trend_strength"),
+                    }))
+
                 fwd=int(self.cfg["model"].get("forward",4))
                 y=label_forward(arr, fwd)
                 X=np.array([[feats["rsi"],feats["atr"],feats["adx"],feats["ob_imb"],feats["spread"]] for _ in range(len(arr))], dtype=float)
@@ -287,6 +318,12 @@ class Engine:
                     "dataset_neg": ds_stats.get('neg', 0),
                     "dataset_pos_rate": ds_stats.get('pos_rate', 0.0),
                 }))
+            self.es.append(mk_event(base, "MODEL_B_TRAINING_STATUS", "INFO", {
+                "training_disabled": bool(disable_b),
+                "reason": getattr(self.model_b_trainer, 'last_retrain_reason', 'unknown'),
+                "last_train_ms": int(getattr(self.model_b_trainer, 'last_train_ms', 0)),
+                "retrain_ms": int(getattr(self.model_b_trainer, 'retrain_ms', 0)),
+            }))
         except Exception as e:
             self.es.append(mk_event(base, "ERROR", "ERROR", {"where": "MODEL_B_RETRAIN", "err": str(e)}))
 

@@ -56,12 +56,14 @@ class CCXTMarket:
         bids = ob.get("bids") or []
         asks = ob.get("asks") or []
         spread = float(asks[0][0]) - float(bids[0][0]) if bids and asks else 0.0
+        mid = (float(asks[0][0]) + float(bids[0][0]))/2.0 if bids and asks else 0.0
+        spread_bps = (spread / max(1e-12, mid)) * 10000.0 if mid>0 else 0.0
         bid_vol = sum(float(v) for _, v in bids) if bids else 0.0
         ask_vol = sum(float(v) for _, v in asks) if asks else 0.0
         denom = bid_vol + ask_vol if (bid_vol+ask_vol)!=0 else 1.0
         imb = (bid_vol - ask_vol) / denom
         ts = int(ob.get("timestamp") or (time.time()*1000))
-        return {"ts": ts, "depth": depth, "spread": spread, "imbalance": imb, "bid_vol": bid_vol, "ask_vol": ask_vol}
+        return {"ts": ts, "depth": depth, "spread": spread, "spread_bps": spread_bps, "imbalance": imb, "bid_vol": bid_vol, "ask_vol": ask_vol, "bids": bids, "asks": asks}
 
     def fetch_prices(self, symbols: List[str], price_source: str = 'last') -> Dict[str, float]:
         out={}

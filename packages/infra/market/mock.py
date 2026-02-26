@@ -32,9 +32,15 @@ class MockMarket:
         return out
 
     def fetch_orderbook(self, symbol: str, depth: int=50) -> Dict[str, Any]:
-        spread = random.random()*2.0
+        mid = 1000.0 + (abs(hash(symbol)) % 50000) + random.random()*5.0
+        spread = max(0.01, random.random()*2.0)
+        bid = mid - spread/2.0
+        ask = mid + spread/2.0
         imb = (random.random()-0.5)*0.6
-        return {"ts": now_ms(), "depth": depth, "spread": spread, "imbalance": imb, "bid_vol": 1000.0, "ask_vol": 900.0}
+        bids = [[bid - i*0.5, 1000.0/(i+1)] for i in range(depth)]
+        asks = [[ask + i*0.5, 900.0/(i+1)] for i in range(depth)]
+        spread_bps = (spread / max(1e-12, mid)) * 10000.0
+        return {"ts": now_ms(), "depth": depth, "spread": spread, "spread_bps": spread_bps, "imbalance": imb, "bid_vol": 1000.0, "ask_vol": 900.0, "bids": bids, "asks": asks}
 
     def fetch_prices(self, symbols: List[str]) -> Dict[str, float]:
         # live-ish prices for mock: last close of short fetch
