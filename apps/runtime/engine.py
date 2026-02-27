@@ -356,6 +356,15 @@ class Engine:
                     gate["decision"] = "FAIL"
                     gate.setdefault("reasons", []).append(f"ENSEMBLE_{str(ens_d.get('no_trade_reason', 'no_trade')).upper()}")
 
+                sl_mult = float(ex_cfg.get("sl_atr_mult", 1.2) or 1.2)
+                tp1_mult = float(ex_cfg.get("tp1_atr_mult", 1.1) or 1.1)
+                tp2_mult = float(ex_cfg.get("tp2_atr_mult", 1.7) or 1.7)
+                base = max(last_close * 0.0012, float(feats.get("atr", 0.0) or 0.0))
+                fallback_sl = (last_close - sl_mult * base) if direction == "LONG" else ((last_close + sl_mult * base) if direction == "SHORT" else None)
+                fallback_tp1 = (last_close + tp1_mult * base) if direction == "LONG" else ((last_close - tp1_mult * base) if direction == "SHORT" else None)
+                fallback_tp2 = (last_close + tp2_mult * base) if direction == "LONG" else ((last_close - tp2_mult * base) if direction == "SHORT" else None)
+                ctx = market_ctx.get(sym, {}) if isinstance(market_ctx, dict) else {}
+
                 self.es.append(mk_event(env,"SIGNAL","INFO",{
                     "direction":direction,
                     "pred":mout["pred"],
@@ -382,7 +391,12 @@ class Engine:
                         ("trend_strength", abs(float(feats.get("trend_strength",0.0)))),
                     ], key=lambda x: x[1], reverse=True)[:3],
                     "gate":gate,
-                    "entry": last_close, "sl": feats.get("sl"), "tp1": feats.get("tp1"), "tp2": feats.get("tp2")
+                    "entry": last_close,
+                    "sl": feats.get("sl") if feats.get("sl") is not None else fallback_sl,
+                    "tp1": feats.get("tp1") if feats.get("tp1") is not None else fallback_tp1,
+                    "tp2": feats.get("tp2") if feats.get("tp2") is not None else fallback_tp2,
+                    "support_level": ctx.get("bid_wall"),
+                    "resistance_level": ctx.get("ask_wall"),
                 }))
 
                 if gate.get("decision")=="PASS" and direction in ("LONG","SHORT") and sym not in self.portfolio.positions:

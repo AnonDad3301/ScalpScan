@@ -217,6 +217,8 @@ class TelegramNotifier:
         elif stage == "TRADE_OPEN":
             if not self.send_trade_open:
                 return False
+            if str(payload.get("result", "OK")) != "OK":
+                return False
         elif stage == "TRADE_CLOSED":
             if not self.send_trade_closed:
                 return False
@@ -262,34 +264,64 @@ class TelegramNotifier:
             timeframe=str(event.get("timeframe", "") or ""),
         )
 
+    def _fmt_num(self, v: Any, digits: int = 6) -> str:
+        try:
+            fv = float(v)
+            return f"{fv:.{digits}f}".rstrip("0").rstrip(".")
+        except Exception:
+            return "н/д"
+
+    def _fmt_pct(self, v: Any, digits: int = 1) -> str:
+        try:
+            fv = float(v)
+            if abs(fv) <= 1.0:
+                fv *= 100.0
+            return f"{fv:.{digits}f}%"
+        except Exception:
+            return "н/д"
+
+    def _gate_reason_ru(self, code: str) -> str:
+        mp = {
+            "DIRECTIONAL_AGREEMENT": "нет согласия моделей",
+            "UNCERTAINTY_MAX": "слишком высокая неопределенность",
+            "EV_POSITIVE": "ожидаемая доходность ниже порога",
+            "SPREAD_MAX": "слишком большой спред",
+            "RR_MIN": "низкое риск/прибыль",
+            "AUC_MIN": "низкое качество модели",
+        }
+        c = str(code or "").strip().upper()
+        return mp.get(c, c or "-")
+
     def _format_message(self, stage: str, p: Dict[str, Any], symbol: str, timeframe: str) -> str:
         if stage == "SIGNAL":
             g = p.get("gate", {}) if isinstance(p.get("gate"), dict) else {}
+            reasons = [self._gate_reason_ru(x) for x in (g.get("reasons", []) or [])]
             lines = [
                 f"📡 <b>Сигнал</b> {symbol} ({timeframe})",
                 f"Направление: <b>{p.get('direction')}</b>",
             ]
             if self.include_probabilities:
-                lines.append(f"Вер. LONG 3m/5m: {p.get('p_up_3m')} / {p.get('p_up_5m')}")
-                lines.append(f"Вер. SHORT 3m/5m: {p.get('p_down_3m')} / {p.get('p_down_5m')}")
-                lines.append(f"TP-first/SL-first: {p.get('p_tp_first')} / {p.get('p_sl_first')}")
-                lines.append(f"Пробой вверх/вниз: {p.get('p_breakout_up')} / {p.get('p_breakout_down')}")
-            lines.append(f"Pred/Conf: {p.get('pred')} / {p.get('confidence')}")
+                lines.append(f"Вероятность LONG (3m/5m): <b>{self._fmt_pct(p.get('p_up_3m'))}</b> / <b>{self._fmt_pct(p.get('p_up_5m'))}</b>")
+                lines.append(f"Вероятность SHORT (3m/5m): <b>{self._fmt_pct(p.get('p_down_3m'))}</b> / <b>{self._fmt_pct(p.get('p_down_5m'))}</b>")
+                lines.append(f"TP раньше SL: {self._fmt_pct(p.get('p_tp_first'))} | SL раньше TP: {self._fmt_pct(p.get('p_sl_first'))}")
+                lines.append(f"Пробой вверх/вниз: {self._fmt_pct(p.get('p_breakout_up'))} / {self._fmt_pct(p.get('p_breakout_down'))}")
+            lines.append(f"Сила сигнала: {self._fmt_pct(p.get('signal_strength'))} | Уверенность: {self._fmt_pct(p.get('confidence'))}")
             if self.include_volatility:
-                lines.append(f"Regime: {p.get('market_regime')} | Signal strength: {p.get('signal_strength')}")
-                lines.append(f"Volatility: {p.get('volatility_pct')}% | ATR pct-rank: {p.get('atr_percentile')}")
-            lines.append(f"Gate: {g.get('decision')} | Причины: {','.join(g.get('reasons', []) or [])}")
+                lines.append(f"Режим: {p.get('market_regime')} | Волатильность: {self._fmt_pct(p.get('volatility_pct'))}")
+                lines.append(f"ATR percentile: {self._fmt_pct(p.get('atr_percentile'))}")
+            lines.append(f"Gate: <b>{g.get('decision')}</b> | Причины: {', '.join(reasons) if reasons else '-'}")
             if self.include_levels:
-                lines.append(f"Entry: {p.get('entry')} | SL: {p.get('sl')} | TP1: {p.get('tp1')} | TP2: {p.get('tp2')}")
+                lines.append(f"Вход: {self._fmt_num(p.get('entry'))} | SL: {self._fmt_num(p.get('sl'))} | TP1: {self._fmt_num(p.get('tp1'))} | TP2: {self._fmt_num(p.get('tp2'))}")
+                lines.append(f"Поддержка/сопротивление: {self._fmt_num(p.get('support_level'))} / {self._fmt_num(p.get('resistance_level'))}")
             if self.include_timing:
                 lines.append(f"ts={now_ms()}")
             return "\n".join(lines)
         if stage == "TRADE_OPEN":
             lines = [f"🟢 <b>Позиция открыта</b> {symbol}"]
-            lines.append(f"Сторона: {p.get('side')} | Entry: {p.get('entry')}")
+            lines.append(f"Сторона: {p.get('side')} | Entry: {self._fmt_num(p.get('entry'))}")
             if self.include_positions:
-                lines.append(f"Qty: {p.get('qty')} | Notional: {p.get('notional')}")
-                lines.append(f"SL: {p.get('sl')} | TP1: {p.get('tp1')} | TP2: {p.get('tp2')}")
+                lines.append(f"Объем: {self._fmt_num(p.get('qty'))} | Номинал: {self._fmt_num(p.get('notional'), 2)}")
+                lines.append(f"SL: {self._fmt_num(p.get('sl'))} | TP1: {self._fmt_num(p.get('tp1'))} | TP2: {self._fmt_num(p.get('tp2'))}")
             if self.include_timing:
                 lines.append(f"ts={now_ms()}")
             return "\n".join(lines)
