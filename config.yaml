@@ -130,6 +130,13 @@ notifications:
     send_signal: true
     send_trade_open: true
     send_trade_closed: true
+    send_on_gate_fail: false
+    min_interval_sec: 2.0
+    include_volatility: true
+    include_positions: true
+    include_levels: true
+    include_probabilities: true
+    include_timing: true
 
 ui:
   theme: dark_green

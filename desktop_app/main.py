@@ -366,6 +366,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ed_tg_enabled = QtWidgets.QCheckBox("Telegram enabled")
         self.ed_tg_token = QtWidgets.QLineEdit()
         self.ed_tg_chat = QtWidgets.QLineEdit()
+        self.ed_tg_signal = QtWidgets.QCheckBox("send_signal")
+        self.ed_tg_trade_open = QtWidgets.QCheckBox("send_trade_open")
+        self.ed_tg_trade_closed = QtWidgets.QCheckBox("send_trade_closed")
+        self.ed_tg_gate_fail = QtWidgets.QCheckBox("send_on_gate_fail")
+        self.ed_tg_min_interval = QtWidgets.QDoubleSpinBox(); self.ed_tg_min_interval.setRange(0.0, 300.0); self.ed_tg_min_interval.setSingleStep(0.5)
+        self.ed_tg_inc_vol = QtWidgets.QCheckBox("include_volatility")
+        self.ed_tg_inc_pos = QtWidgets.QCheckBox("include_positions")
+        self.ed_tg_inc_levels = QtWidgets.QCheckBox("include_levels")
+        self.ed_tg_inc_prob = QtWidgets.QCheckBox("include_probabilities")
+        self.ed_tg_inc_timing = QtWidgets.QCheckBox("include_timing")
         self.ed_timeframe = QtWidgets.QComboBox(); self.ed_timeframe.addItems(["1m","3m","5m","15m"])
         self.ed_theme = QtWidgets.QComboBox(); self.ed_theme.addItems(["light","dark_green"])
 
@@ -381,6 +391,16 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow("telegram.enabled", self.ed_tg_enabled)
         form.addRow("telegram.bot_token", self.ed_tg_token)
         form.addRow("telegram.chat_id", self.ed_tg_chat)
+        form.addRow("telegram.send_signal", self.ed_tg_signal)
+        form.addRow("telegram.send_trade_open", self.ed_tg_trade_open)
+        form.addRow("telegram.send_trade_closed", self.ed_tg_trade_closed)
+        form.addRow("telegram.send_on_gate_fail", self.ed_tg_gate_fail)
+        form.addRow("telegram.min_interval_sec", self.ed_tg_min_interval)
+        form.addRow("telegram.include_volatility", self.ed_tg_inc_vol)
+        form.addRow("telegram.include_positions", self.ed_tg_inc_pos)
+        form.addRow("telegram.include_levels", self.ed_tg_inc_levels)
+        form.addRow("telegram.include_probabilities", self.ed_tg_inc_prob)
+        form.addRow("telegram.include_timing", self.ed_tg_inc_timing)
         form.addRow("runtime.timeframe", self.ed_timeframe)
         form.addRow("ui.theme", self.ed_theme)
         lay.addLayout(form)
@@ -399,6 +419,7 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(self.lbl_settings)
         self.tabs.addTab(w, "Настройки")
         self._settings_load()
+        self._last_cmd_seen_ts = 0
 
     def _settings_load(self):
         try:
@@ -418,6 +439,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ed_tg_enabled.setChecked(bool(tg.get("enabled", False)))
             self.ed_tg_token.setText(str(tg.get("bot_token", "")))
             self.ed_tg_chat.setText(str(tg.get("chat_id", "")))
+            self.ed_tg_signal.setChecked(bool(tg.get("send_signal", True)))
+            self.ed_tg_trade_open.setChecked(bool(tg.get("send_trade_open", True)))
+            self.ed_tg_trade_closed.setChecked(bool(tg.get("send_trade_closed", True)))
+            self.ed_tg_gate_fail.setChecked(bool(tg.get("send_on_gate_fail", False)))
+            self.ed_tg_min_interval.setValue(float(tg.get("min_interval_sec", 2.0)))
+            self.ed_tg_inc_vol.setChecked(bool(tg.get("include_volatility", True)))
+            self.ed_tg_inc_pos.setChecked(bool(tg.get("include_positions", True)))
+            self.ed_tg_inc_levels.setChecked(bool(tg.get("include_levels", True)))
+            self.ed_tg_inc_prob.setChecked(bool(tg.get("include_probabilities", True)))
+            self.ed_tg_inc_timing.setChecked(bool(tg.get("include_timing", True)))
             self.ed_timeframe.setCurrentText(str((c.get("runtime", {}) or {}).get("timeframe", "1m")))
             self.ed_theme.setCurrentText(str((c.get("ui", {}) or {}).get("theme", "light")))
             self.lbl_settings.setText("Статус: настройки загружены")
@@ -444,14 +475,22 @@ class MainWindow(QtWidgets.QMainWindow):
             tg["enabled"] = bool(self.ed_tg_enabled.isChecked())
             tg["bot_token"] = self.ed_tg_token.text().strip()
             tg["chat_id"] = self.ed_tg_chat.text().strip()
-            tg.setdefault("send_signal", True)
-            tg.setdefault("send_trade_open", True)
-            tg.setdefault("send_trade_closed", True)
+            tg["send_signal"] = bool(self.ed_tg_signal.isChecked())
+            tg["send_trade_open"] = bool(self.ed_tg_trade_open.isChecked())
+            tg["send_trade_closed"] = bool(self.ed_tg_trade_closed.isChecked())
+            tg["send_on_gate_fail"] = bool(self.ed_tg_gate_fail.isChecked())
+            tg["min_interval_sec"] = float(self.ed_tg_min_interval.value())
+            tg["include_volatility"] = bool(self.ed_tg_inc_vol.isChecked())
+            tg["include_positions"] = bool(self.ed_tg_inc_pos.isChecked())
+            tg["include_levels"] = bool(self.ed_tg_inc_levels.isChecked())
+            tg["include_probabilities"] = bool(self.ed_tg_inc_prob.isChecked())
+            tg["include_timing"] = bool(self.ed_tg_inc_timing.isChecked())
             c.setdefault("runtime", {})["timeframe"] = self.ed_timeframe.currentText()
             c.setdefault("ui", {})["theme"] = self.ed_theme.currentText()
             with open(self.cfg_path, "w", encoding="utf-8") as f:
                 yaml.safe_dump(c, f, allow_unicode=True, sort_keys=False)
-            self.lbl_settings.setText("Статус: config сохранен. Перезапустите backend/hub.py (и UI для темы)")
+            write_cmd(self.cfg, "reload_config")
+            self.lbl_settings.setText("Статус: config сохранен и применен без перезапуска (тема UI может требовать перезапуск)")
         except Exception as e:
             self.lbl_settings.setText(f"Статус: ошибка сохранения ({e})")
 
@@ -662,6 +701,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 prob_rows.append([fmt_ts(e.get("ts")), e.get("symbol"), f"{float(p.get('p_up_3m',0.0)):.2%}", f"{float(p.get('p_up_5m',0.0)):.2%}", "—", "—", "—", "—", "—", f"{float(p.get('ret_3m',0.0)):.4f}", f"{float(p.get('ret_5m',0.0)):.4f}"])
         merged = (prob_rows + perf_rows)[-400:]
         self.tbl_prob.set_rows(merged[-250:])
+
+        # last command feedback (telegram test / reload config)
+        for e in reversed(self.events[-500:]):
+            if e.get("stage") == "CMD":
+                ts = int(e.get("ts") or 0)
+                if ts <= int(getattr(self, "_last_cmd_seen_ts", 0) or 0):
+                    break
+                p = e.get("payload") or {}
+                cmd = str(p.get("cmd", ""))
+                if cmd in ("send_test_telegram", "reload_config"):
+                    self._last_cmd_seen_ts = ts
+                    ok = bool(p.get("ok", False))
+                    status = p.get("status", "")
+                    reason = p.get("reason", "")
+                    msg = f"Статус: CMD {cmd}: {'OK' if ok or status in ('sent','applied') else 'FAIL'} {reason}".strip()
+                    self.lbl_settings.setText(msg)
+                break
 
         # closed trades
         closed_rows=[]
