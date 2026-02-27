@@ -7,6 +7,7 @@ import numpy as np
 
 from packages.feature.pipeline import compute as compute_features
 from packages.feature.invariants import check as inv_check, ok as inv_ok
+from packages.feature.indicators import rsi as ta_rsi, atr as ta_atr, adx_wilder as ta_adx
 from packages.model.trainer import OnlineTrainer
 from packages.model.ensemble import meta_decide
 from packages.model.labeling import triple_barrier_labels
@@ -60,10 +61,12 @@ class Engine:
         self.model_b = ModelBPatchTST(hf_id=str(cfg.get('model_b',{}).get('hf_id','ibm-research/patchtst-fm-r1')), cache_dir=str(cfg.get('model_b',{}).get('cache_dir','data/hf_cache')), device=str(cfg.get('model_b',{}).get('device','cpu')))
         self.model_b_state = self.model_b.load()
         self.registry = Registry(root=str(cfg.get('storage',{}).get('model_registry','data/model_registry')))
+        est_costs_bps = float(cfg.get("execution", {}).get("fees_bps", 0.0) or 0.0) + float(cfg.get("execution", {}).get("slippage_bps", 0.0) or 0.0)
         self.ds_builder = DatasetBuilder(path=str(cfg.get('storage',{}).get('model_b_dataset','data/datasets/model_b_samples.csv')),
                                         horizon_bars=int(cfg.get('model_b',{}).get('horizon_bars',12)),
                                         breakout_atr=float(cfg.get('model_b',{}).get('breakout_atr',0.25)),
-                                        hold_bars=int(cfg.get('model_b',{}).get('hold_bars',2)))
+                                        hold_bars=int(cfg.get('model_b',{}).get('hold_bars',2)),
+                                        label_ret_threshold=float(cfg.get('model_b', {}).get('label_ret_threshold', max(1e-5, (est_costs_bps / 10000.0) * 0.75))))
         self.model_b_trainer = Trainer(dataset_path=self.ds_builder.path, registry=self.registry,
                                             retrain_interval_sec=float(cfg.get('model_b',{}).get('retrain_interval_sec',1800.0)))
         self.es.append(mk_event(base_init, 'MODEL_B_LOAD_END', 'INFO' if self.model_b_state.loaded else 'ERROR', {'state': self.model_b_state.__dict__}))
@@ -98,6 +101,33 @@ class Engine:
         out = [symbols[(start + i) % len(symbols)] for i in range(per_tick)]
         self._symbol_cursor = (start + per_tick) % len(symbols)
         return out
+
+
+
+    def _build_model_a_matrix(self, ohlcv: List[tuple], ob: Dict[str, Any]) -> np.ndarray:
+        if not ohlcv:
+            return np.zeros((0, 5), dtype=float)
+        arr = np.asarray([[o, h, l, c, v] for _, o, h, l, c, v in ohlcv], dtype=float)
+        high = arr[:, 1]
+        low = arr[:, 2]
+        close = arr[:, 3]
+
+        spread = float(ob.get("spread", 0.0) or 0.0)
+        ob_imb = float(ob.get("imbalance", 0.0) or 0.0)
+
+        rows = []
+        for i in range(len(close)):
+            h = high[: i + 1]
+            l = low[: i + 1]
+            c = close[: i + 1]
+            rows.append([
+                ta_rsi(c, 14),
+                ta_atr(h, l, c, 14),
+                ta_adx(h, l, c, 14),
+                ob_imb,
+                spread,
+            ])
+        return np.asarray(rows, dtype=float)
 
 
     def sync_symbols(self) -> int:
@@ -311,7 +341,7 @@ class Engine:
                     tp_atr_mult=float(self.cfg.get("execution", {}).get("exits", {}).get("tp1_atr_mult", 1.1)),
                     sl_atr_mult=float(self.cfg.get("execution", {}).get("exits", {}).get("sl_atr_mult", 1.2)),
                 )
-                X=np.array([[feats["rsi"],feats["atr"],feats["adx"],feats["ob_imb"],feats["spread"]] for _ in range(len(arr))], dtype=float)
+                X=self._build_model_a_matrix(ohlcv, ob)
 
                 added=self.trainer.add_samples(X[:-fwd], y[:-fwd])
                 scan_stats["samples_added"] += int(added)
@@ -384,14 +414,28 @@ class Engine:
                         i=len(ohlcv)-(h+2)
                         c0=float(ohlcv[i][4]); c1=float(ohlcv[i+h][4])
                         ret=(c1-c0)/max(1e-12,c0)
-                        self.ds_builder.append_shadow(int(time.time()*1000), sym, int(ohlcv[-2][0]) if len(ohlcv)>1 else 0,
+                        written = self.ds_builder.append_shadow(int(time.time()*1000), sym, int(ohlcv[-2][0]) if len(ohlcv)>1 else 0,
                                                      int(time.time()*1000), price_source, "bybit.linear.swap", model_b_feats, ret)
-                        self.es.append(mk_event(env, "MODEL_B_DATASET_APPEND", "INFO", {"symbol": sym, "rows": self.ds_builder.stats().get("rows", 0), "ret": ret, "label": 1 if ret > 0 else 0}))
+                        if written:
+                            self.es.append(mk_event(env, "MODEL_B_DATASET_APPEND", "INFO", {"symbol": sym, "rows": self.ds_builder.stats().get("rows", 0), "ret": ret, "label": 1 if ret > 0 else 0}))
+                        else:
+                            self.es.append(mk_event(env, "MODEL_B_DATASET_SKIP", "INFO", {"symbol": sym, "ret": ret, "reason": "RET_THRESHOLD"}))
                 except Exception as e:
                     self.es.append(mk_event(env,"ERROR","ERROR",{"where":"MODEL_B_SHADOW","err":str(e)}))
 
                 model_b_prob = float(locals().get("prob", 0.5))
-                ensemble_cfg = ((self.cfg.get("model", {}) or {}).get("ensemble", {}) or {})
+                ensemble_cfg = dict(((self.cfg.get("model", {}) or {}).get("ensemble", {}) or {}))
+                min_samples_for_a = int(self.cfg.get("model", {}).get("min_samples", 300) or 300)
+                reliability = min(1.0, max(0.1, float(mhealth.get("samples", 0)) / max(1.0, float(min_samples_for_a))))
+                if mout.get("bootstrap_mode") == "forecast":
+                    reliability = min(reliability, 0.35)
+                base_wa = float(ensemble_cfg.get("w_a", 0.55))
+                base_wb = float(ensemble_cfg.get("w_b", 0.45))
+                dyn_wa = max(0.10, min(0.80, base_wa * reliability))
+                dyn_wb = max(0.10, min(0.90, base_wb + (base_wa - dyn_wa)))
+                norm = max(1e-9, dyn_wa + dyn_wb)
+                ensemble_cfg["w_a"] = dyn_wa / norm
+                ensemble_cfg["w_b"] = dyn_wb / norm
                 ens = meta_decide(
                     model_a={"p_up_3m": p_a_up3, "p_up_5m": p_a_up5},
                     model_b={"p_up_3m": model_b_prob, "p_up_5m": model_b_prob},
@@ -399,12 +443,18 @@ class Engine:
                     cfg=ensemble_cfg,
                 )
                 ens_d = ens.as_dict()
+                ens_d["w_a"] = float(ensemble_cfg.get("w_a", 0.55))
+                ens_d["w_b"] = float(ensemble_cfg.get("w_b", 0.45))
+                ens_d["model_a_reliability"] = float(reliability)
                 self.es.append(mk_event(env, "ENSEMBLE_INFERRED", "INFO", ens_d))
                 mout["p_tp_first"] = ens_d.get("p_tp_first", 0.5)
                 mout["p_sl_first"] = ens_d.get("p_sl_first", 0.5)
                 mout["pred"] = (ens_d.get("p_up_3m", 0.5) - 0.5) * 2.0
                 mout["confidence"] = ens_d.get("confidence", mout.get("confidence", 0.5))
-                mout["model_a_direction"] = "LONG" if p_a_up3 >= 0.5 else "SHORT"
+                if reliability < 0.5:
+                    mout["model_a_direction"] = "NEUTRAL"
+                else:
+                    mout["model_a_direction"] = "LONG" if p_a_up3 >= 0.5 else "SHORT"
                 b_margin = float(self.cfg.get("model_b", {}).get("agreement_margin", 0.08) or 0.08)
                 if abs(model_b_prob - 0.5) < b_margin:
                     mout["model_b_direction"] = "NEUTRAL"

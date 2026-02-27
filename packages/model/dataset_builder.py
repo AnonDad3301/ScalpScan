@@ -7,6 +7,7 @@ class DatasetBuilder:
         self.path = path
         self.horizon_bars = int(horizon_bars)
         self.extra = dict(kwargs)
+        self.label_ret_threshold = float(kwargs.get("label_ret_threshold", 0.0) or 0.0)
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         if not os.path.exists(self.path):
             with open(self.path, "w", newline="", encoding="utf-8") as f:
@@ -16,7 +17,9 @@ class DatasetBuilder:
                 ])
 
     def append_shadow(self, ts:int, symbol:str, bar_ts:int, decision_ts:int, price_source:str, market_type:str,
-                      feats: Dict[str,float], ret: float) -> None:
+                      feats: Dict[str,float], ret: float) -> bool:
+        if abs(float(ret)) < self.label_ret_threshold:
+            return False
         label = 1 if ret > 0 else 0
         row = [
             ts, symbol, label, ret, bar_ts, decision_ts, price_source, market_type,
@@ -26,6 +29,7 @@ class DatasetBuilder:
         ]
         with open(self.path, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(row)
+        return True
 
     def stats(self) -> Dict[str, Any]:
         if not os.path.exists(self.path):

@@ -2,6 +2,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Any
 import numpy as np
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 @dataclass
 class Metrics:
@@ -13,7 +15,10 @@ class Metrics:
 class ModelBHead:
     def __init__(self):
         from sklearn.linear_model import SGDClassifier
-        self.clf = SGDClassifier(loss="log_loss", alpha=1e-4, max_iter=2000, tol=1e-4)
+        self.clf = make_pipeline(
+            StandardScaler(),
+            SGDClassifier(loss="log_loss", alpha=1e-4, max_iter=2000, tol=1e-4),
+        )
         self.fitted=False
         self.metrics=Metrics()
 
@@ -39,7 +44,7 @@ class ModelBHead:
     def proba(self, X: np.ndarray) -> np.ndarray:
         if not self.fitted:
             return np.full((len(X),), 0.5, dtype=float)
-        z=self.clf.decision_function(X)
+        z=self.clf.decision_function(np.asarray(X, dtype=float))
         z=np.clip(z, -60.0, 60.0)
         return 1.0/(1.0+np.exp(-z))
 
