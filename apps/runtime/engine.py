@@ -86,6 +86,18 @@ class Engine:
         )
         self._open_feature_bank: Dict[str, np.ndarray] = {}
         self._sl_streak: int = 0
+        self._symbol_cursor: int = 0
+
+
+    def _symbols_for_tick(self, symbols: List[str]) -> List[str]:
+        rt = self.cfg.get("runtime", {}) or {}
+        per_tick = int(rt.get("tick_symbols_per_cycle", 8) or 0)
+        if per_tick <= 0 or per_tick >= len(symbols):
+            return symbols
+        start = int(self._symbol_cursor % len(symbols))
+        out = [symbols[(start + i) % len(symbols)] for i in range(per_tick)]
+        self._symbol_cursor = (start + per_tick) % len(symbols)
+        return out
 
 
     def sync_symbols(self) -> int:
@@ -112,12 +124,18 @@ class Engine:
         run_id=str(uuid.uuid4())
         base={"run_id":run_id,"service":"sf-runtime","exchange":rt["exchange"],"market":rt["market"],"timeframe":rt["timeframe"],"symbol":"*"}
         symbols=self.universe()
-        self.es.append(mk_event(base,"UNIVERSE_SELECTED","INFO",{"selected_n":len(symbols),"selected":symbols[:1000]}))
+        tick_symbols = self._symbols_for_tick(symbols) if symbols else []
+        self.es.append(mk_event(base,"UNIVERSE_SELECTED","INFO",{
+            "selected_n": len(symbols),
+            "tick_n": len(tick_symbols),
+            "cursor": int(self._symbol_cursor),
+            "selected": tick_symbols[:1000],
+        }))
 
         prices: Dict[str, float] = {}
         market_ctx: Dict[str, Dict[str, Any]] = {}
 
-        for sym in symbols:
+        for sym in tick_symbols:
             env=dict(base); env["symbol"]=sym
             try:
                 sp1=self.telemetry.span_start('FETCH_OHLCV', trace_id=run_id, symbol=sym)
