@@ -582,6 +582,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 if mh:
                     self.model_health = mh
                 break
+            if e.get("stage") == "MODEL_A_STATUS":
+                mh = (e.get("payload") or {})
+                if mh:
+                    self.model_health = mh
+                break
         for e in tail:
             if e.get("stage") == "TRADE_OUTCOME_STATS":
                 self.trade_outcome_stats = (e.get("payload") or {})
@@ -870,7 +875,7 @@ class MainWindow(QtWidgets.QMainWindow):
             buf.append('')
 
         for e in self.events[-500:]:
-            if e.get("stage") in ("PRICE_TICK","ERROR","TRADE_OPEN","TRADE_CLOSED","MODEL_B_STATUS","MODEL_B_RETRAIN","MODEL_B_RETRAIN_SKIPPED","POSITION_UPDATE","TRADE_OUTCOME_STATS","SHORT_TERM_LEVEL_PROB"):
+            if e.get("stage") in ("PRICE_TICK","ERROR","TRADE_OPEN","TRADE_CLOSED","MODEL_A_STATUS","MODEL_B_STATUS","MODEL_B_RETRAIN","MODEL_B_RETRAIN_SKIPPED","POSITION_UPDATE","TRADE_OUTCOME_STATS","SHORT_TERM_LEVEL_PROB"):
                 buf.append(f"{fmt_ts(e.get('ts'))} {e.get('stage')} {e.get('symbol')} {json.dumps(e.get('payload',{}), ensure_ascii=False)[:500]}")
         self.txt_mon.setPlainText("\n".join(buf[-250:]) if buf else "Пока нет событий. Запусти hub и нажми Старт сканера.")
 

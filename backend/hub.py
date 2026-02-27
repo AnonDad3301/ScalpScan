@@ -328,8 +328,17 @@ class TelegramNotifier:
         if stage == "TRADE_CLOSED":
             lines = [f"🔴 <b>Позиция закрыта</b> {symbol}"]
             if self.include_positions:
-                lines.append(f"Причина: {p.get('reason')}")
-                lines.append(f"Entry: {p.get('entry')} | Exit: {p.get('exit')} | PnL: <b>{p.get('pnl')}</b>")
+                lines.append(f"Сторона: {p.get('side')} | Причина: {p.get('reason')}")
+                lines.append(
+                    f"Entry: {self._fmt_num(p.get('entry'))} | Exit: {self._fmt_num(p.get('exit'))} | "
+                    f"PnL: <b>{self._fmt_num(p.get('pnl'), 2)}</b>"
+                )
+                trade_ref = p.get("open_trade_event_id") or p.get("trade_id") or p.get("position_id") or "-"
+                signal_ref = p.get("signal_event_id") or p.get("signal_id") or "-"
+                lines.append(f"TradeRef: <code>{trade_ref}</code>")
+                lines.append(f"SignalRef: <code>{signal_ref}</code>")
+                if p.get("open_ts") or p.get("close_ts"):
+                    lines.append(f"Open ts: {p.get('open_ts', '-')} | Close ts: {p.get('close_ts', '-')}")
             if self.include_timing:
                 lines.append(f"ts={now_ms()}")
             return "\n".join(lines)

@@ -91,6 +91,7 @@ class Engine:
             trend_threshold=float(mod_cfg.get('regime_trend_threshold', 0.25)),
         )
         self._open_feature_bank: Dict[str, np.ndarray] = {}
+        self._open_trade_meta: Dict[str, Dict[str, Any]] = {}
         self._sl_streak: int = 0
         self._symbol_cursor: int = 0
 
@@ -578,7 +579,7 @@ class Engine:
                 fallback_tp2 = (last_close + tp2_mult * base) if direction == "LONG" else ((last_close - tp2_mult * base) if direction == "SHORT" else None)
                 ctx = market_ctx.get(sym, {}) if isinstance(market_ctx, dict) else {}
 
-                self.es.append(mk_event(env,"SIGNAL","INFO",{
+                signal_event = mk_event(env,"SIGNAL","INFO",{
                     "direction":direction,
                     "pred":mout["pred"],
                     "confidence":mout["confidence"],
@@ -614,13 +615,24 @@ class Engine:
                     "tp2": feats.get("tp2") if feats.get("tp2") is not None else fallback_tp2,
                     "support_level": ctx.get("bid_wall"),
                     "resistance_level": ctx.get("ask_wall"),
-                }))
+                })
+                self.es.append(signal_event)
 
                 if gate.get("decision")=="PASS" and direction in ("LONG","SHORT") and sym not in self.portfolio.positions:
                     res=self.portfolio.open(now_ms(), sym, direction, last_close, feats["atr"])
+                    trade_meta = {
+                        "signal_event_id": signal_event.get("event_id"),
+                        "signal_run_id": run_id,
+                        "signal_ts": signal_event.get("ts"),
+                        "symbol": sym,
+                        "side": direction,
+                    }
                     if res.get("result") == "OK":
                         self._open_feature_bank[sym] = np.asarray(x_last, dtype=float)
-                    self.es.append(mk_event(env,"TRADE_OPEN","INFO",{**res, "symbol": sym, "side": direction, "entry": last_close}))
+                    trade_open_event = mk_event(env,"TRADE_OPEN","INFO",{**res, **trade_meta, "symbol": sym, "side": direction, "entry": last_close})
+                    self.es.append(trade_open_event)
+                    if res.get("result") == "OK":
+                        self._open_trade_meta[sym] = {**trade_meta, "open_trade_event_id": trade_open_event.get("event_id")}
 
                 scan_stats["processed"] += 1
 
@@ -701,6 +713,10 @@ class Engine:
             for u in updates:
                 self.es.append(mk_event(base, "POSITION_UPDATE", "INFO", u))
             for c in closed:
+                sym = str(c.get("symbol", ""))
+                meta = self._open_trade_meta.pop(sym, {}) if sym else {}
+                if isinstance(meta, dict) and meta:
+                    c = {**c, **meta}
                 self.es.append(mk_event(base, "TRADE_CLOSED", "INFO", c))
                 try:
                     reason = str(c.get("reason", ""))
@@ -708,7 +724,6 @@ class Engine:
                         self._sl_streak += 1
                     elif reason in ("TP2", "TIME_STOP"):
                         self._sl_streak = 0
-                    sym = str(c.get("symbol", ""))
                     x = self._open_feature_bank.pop(sym, None)
                     pnl = float(c.get("pnl", 0.0) or 0.0)
                     y = 1 if pnl > 0 else (-1 if pnl < 0 else 0)
@@ -746,6 +761,13 @@ class Engine:
             "error_rate_pct": float(100.0 * scan_stats["errors"] / max(1, scan_stats["symbols_tick"])),
         }))
         # Model-B status heartbeat
+        try:
+            self.es.append(mk_event(base, "MODEL_A_STATUS", "INFO", {
+                **self.trainer.health(),
+                "since_last_added": int(getattr(self.trainer, "_since_last_added", 0)),
+            }))
+        except Exception:
+            pass
         try:
             st = self.ds_builder.stats() if hasattr(self,'ds_builder') else {}
             ds_stats = self.model_b_trainer.dataset_stats() if hasattr(self, 'model_b_trainer') else {}

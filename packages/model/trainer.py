@@ -56,6 +56,8 @@ class OnlineTrainer:
                 drop = len(self.X) - self.max_train_samples
                 self.X = self.X[drop:]
                 self.y = self.y[drop:]
+            # keep health() and UI counters live even when retrain is throttled
+            self.metrics.samples = len(self.X)
         return added
 
     def maybe_retrain(self, now_ms: Optional[int]=None, force: bool=False) -> Tuple[Metrics, bool]:
@@ -120,7 +122,9 @@ class OnlineTrainer:
         return {"pred": pred, "confidence": conf}
 
     def health(self) -> Dict[str, Any]:
-        return {"samples": self.metrics.samples, "auc": self.metrics.auc, "accuracy": self.metrics.accuracy, "version": self.metrics.version}
+        samples = len(self.X)
+        self.metrics.samples = samples
+        return {"samples": samples, "auc": self.metrics.auc, "accuracy": self.metrics.accuracy, "version": self.metrics.version}
 
     def on_trade_closed(self, trade: dict) -> None:
         # placeholder for future: supervised updates on closed trades
