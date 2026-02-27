@@ -117,6 +117,30 @@ class SignalFeatureGateTests(unittest.TestCase):
         self.assertEqual(out["decision"], "PASS")
 
 
+    def test_gate_soft_allows_low_samples_when_not_enforced(self):
+        features = {
+            "adx": 30, "spread_bps": 5, "spread_pct_rank": 0.2, "latency_ms": 100,
+            "volz": 0.4, "forecast_uncertainty": 0.003, "rr_ratio": 1.4, "trend_strength": 0.3,
+            "regime": "trend", "tp_return": 0.012, "sl_return": 0.006, "costs_bps": 3.0, "sl_streak": 0,
+        }
+        out = decide(
+            features,
+            inv_results=[{"pass": True}],
+            model_out={"confidence": 0.7, "pred": 0.2, "p_tp_first": 0.62, "model_a_direction": "LONG", "model_b_direction": "LONG"},
+            model_health={"samples": 5, "auc": 0.45},
+            cfg={
+                "profile": "scalp",
+                "profiles": {"scalp": {
+                    "entry_threshold": 0.06, "confidence_min": 0.52, "adx_min": 8, "spread_max": 20,
+                    "volz_max": 3.5, "uncertainty_max": 0.02, "rr_min": 0.9, "trend_strength_min": 0.05,
+                    "enforce_auc_min": False, "enforce_directional_agreement": False, "enforce_high_confidence": False,
+                    "enforce_model_samples_min": False,
+                }},
+                "min_samples": 50, "auc_warmup_samples": 600, "min_auc": 0.52,
+            },
+        )
+        self.assertEqual(out["decision"], "PASS")
+
     def test_gate_blocks_extreme_spread_window(self):
         features = {
             "adx": 25, "spread_bps": 3, "spread_pct_rank": 0.99, "latency_ms": 1500,

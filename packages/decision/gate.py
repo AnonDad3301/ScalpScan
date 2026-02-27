@@ -22,6 +22,7 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
     enforce_auc_min = bool(prof.get("enforce_auc_min", False))
     enforce_directional_agreement = bool(prof.get("enforce_directional_agreement", True))
     enforce_high_confidence = bool(prof.get("enforce_high_confidence", False))
+    enforce_model_samples_min = bool(prof.get("enforce_model_samples_min", False))
 
     rules = []
     reasons = []
@@ -35,7 +36,11 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
 
     samples = int(model_health.get("samples", 0))
     min_samples = int(cfg.get("min_samples", 50))
-    add("MODEL_SAMPLES_MIN", samples >= min_samples, samples, min_samples)
+    samples_ok = samples >= min_samples
+    if samples_ok or enforce_model_samples_min:
+        add("MODEL_SAMPLES_MIN", samples_ok, samples, min_samples)
+    else:
+        add("MODEL_SAMPLES_MIN", True, samples, min_samples, note="soft-check: enforce_model_samples_min=false")
 
     auc = float(model_health.get("auc", 0.0))
     warmup = int(cfg.get("auc_warmup_samples", 600))

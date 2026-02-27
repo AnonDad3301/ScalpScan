@@ -265,6 +265,19 @@ class Engine:
                 p_a_up3 = float(max(0.0, min(1.0, 0.5 + 0.5 * mout.get("pred", 0.0))))
                 p_a_up5 = float(max(0.0, min(1.0, 0.5 + 0.35 * mout.get("pred", 0.0))))
                 mhealth=self.trainer.health()
+                try:
+                    min_samples_boot = int(self.cfg.get("model", {}).get("min_samples", 50))
+                    bootstrap_on_cold = bool(self.cfg.get("model", {}).get("bootstrap_from_forecast", True))
+                    is_cold = int(mhealth.get("samples", 0)) < min_samples_boot
+                    is_flat = abs(float(mout.get("pred", 0.0))) < 1e-9
+                    if bootstrap_on_cold and is_cold and is_flat:
+                        p_a_up3 = float(max(0.0, min(1.0, p3)))
+                        p_a_up5 = float(max(0.0, min(1.0, p5)))
+                        mout["pred"] = float((p_a_up3 - 0.5) * 2.0)
+                        mout["confidence"] = float(max(p_a_up3, 1.0 - p_a_up3))
+                        mout["bootstrap_mode"] = "forecast"
+                except Exception:
+                    pass
                 self.es.append(mk_event(env,"MODEL_INFERRED","INFO",{
                     "pred":mout["pred"],"confidence":mout["confidence"],
                     "p_up_3m": p_a_up3, "p_up_5m": p_a_up5,
