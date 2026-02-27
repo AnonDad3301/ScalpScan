@@ -209,5 +209,32 @@ class SignalFeatureGateTests(unittest.TestCase):
         self.assertEqual(out["decision"], "PASS")
 
 
+    def test_gate_blocks_when_strong_60m_trend_conflicts(self):
+        features = {
+            "adx": 30, "spread_bps": 5, "spread_pct_rank": 0.2, "latency_ms": 100,
+            "volz": 0.4, "forecast_uncertainty": 0.003, "rr_ratio": 1.4, "trend_strength": 0.3,
+            "regime": "trend", "tp_return": 0.012, "sl_return": 0.006, "costs_bps": 3.0, "sl_streak": 0,
+            "trend_dir_60m": "SHORT", "trend_score_60m": -1.2,
+        }
+        out = decide(
+            features,
+            inv_results=[{"pass": True}],
+            model_out={"confidence": 0.66, "pred": 0.3, "p_tp_first": 0.62, "model_a_direction": "LONG", "model_b_direction": "LONG"},
+            model_health={"samples": 900, "auc": 0.65},
+            cfg={
+                "profile": "scalp",
+                "profiles": {"scalp": {
+                    "entry_threshold": 0.06, "confidence_min": 0.52, "adx_min": 8, "spread_max": 20,
+                    "volz_max": 3.5, "uncertainty_max": 0.02, "rr_min": 0.9, "trend_strength_min": 0.05,
+                    "enforce_auc_min": False, "enforce_directional_agreement": False, "enforce_high_confidence": False,
+                    "enforce_mtf_alignment": True,
+                }},
+                "min_samples": 50, "auc_warmup_samples": 600, "min_auc": 0.52,
+            },
+        )
+        self.assertEqual(out["decision"], "FAIL")
+        self.assertIn("MTF_TREND_ALIGNMENT", out["reasons"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -23,6 +23,7 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
     enforce_directional_agreement = bool(prof.get("enforce_directional_agreement", True))
     enforce_high_confidence = bool(prof.get("enforce_high_confidence", False))
     enforce_model_samples_min = bool(prof.get("enforce_model_samples_min", False))
+    enforce_mtf_alignment = bool(prof.get("enforce_mtf_alignment", True))
 
     rules = []
     reasons = []
@@ -110,6 +111,14 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
     else:
         agree = (model_a_direction == model_b_direction)
     add("DIRECTIONAL_AGREEMENT", agree, f"{model_a_direction}/{model_b_direction}", "same")
+
+    trend_60 = str(features.get("trend_dir_60m", "NEUTRAL"))
+    pred_dir = "LONG" if float(model_out.get("pred", 0.0)) >= 0.0 else "SHORT"
+    trend_60_score = abs(float(features.get("trend_score_60m", 0.0) or 0.0))
+    if enforce_mtf_alignment and trend_60 in ("LONG", "SHORT") and trend_60_score >= 0.8:
+        add("MTF_TREND_ALIGNMENT", pred_dir == trend_60, f"{pred_dir}/{trend_60}", "same")
+    else:
+        add("MTF_TREND_ALIGNMENT", True, f"{pred_dir}/{trend_60}", "soft")
 
     costs = float(features.get("costs_bps", 0.0)) / 10000.0
     tp = float(features.get("tp_return", 0.0))

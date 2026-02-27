@@ -2,7 +2,7 @@ from __future__ import annotations
 import time
 from packages.obs.messages import explain
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import numpy as np
 
 from packages.feature.pipeline import compute as compute_features
@@ -130,6 +130,60 @@ class Engine:
         return np.asarray(rows, dtype=float)
 
 
+
+    def _timeframe_minutes(self, tf: Optional[str]) -> int:
+        t = str(tf or "").strip().lower()
+        if t.endswith("m"):
+            return max(1, int(float(t[:-1] or 1)))
+        if t.endswith("h"):
+            return max(1, int(float(t[:-1] or 1) * 60))
+        return 1
+
+    def _mtf_trend_context(self, close: np.ndarray, timeframe: str) -> Dict[str, Any]:
+        if close.size < 8:
+            return {
+                "dir_15m": "NEUTRAL",
+                "dir_60m": "NEUTRAL",
+                "score_15m": 0.0,
+                "score_60m": 0.0,
+                "bias": 0.0,
+            }
+        tf_min = self._timeframe_minutes(timeframe)
+
+        def _score(window_min: int) -> float:
+            bars = max(3, int(round(window_min / max(1, tf_min))))
+            bars = min(int(close.size - 1), bars)
+            if bars < 3:
+                return 0.0
+            seg = close[-(bars+1):]
+            if seg.size < 4:
+                return 0.0
+            ret = float((seg[-1] - seg[0]) / max(1e-12, seg[0]))
+            noise = float(np.std(np.diff(seg) / np.maximum(1e-12, seg[:-1])))
+            return ret / max(1e-6, noise)
+
+        s15 = _score(15)
+        s60 = _score(60)
+
+        def _dir(v: float) -> str:
+            if v > 0.35:
+                return "LONG"
+            if v < -0.35:
+                return "SHORT"
+            return "NEUTRAL"
+
+        d15 = _dir(s15)
+        d60 = _dir(s60)
+        bias = 0.35 * np.tanh(0.6 * s15) + 0.65 * np.tanh(0.35 * s60)
+        return {
+            "dir_15m": d15,
+            "dir_60m": d60,
+            "score_15m": float(s15),
+            "score_60m": float(s60),
+            "bias": float(max(-1.0, min(1.0, bias))),
+        }
+
+
     def sync_symbols(self) -> int:
         rows = self.market.fetch_symbols()
         return self.symdb.upsert_many(self.cfg["runtime"]["exchange"], self.cfg["runtime"]["market"], rows)
@@ -252,6 +306,7 @@ class Engine:
                     continue
 
                 arr=np.array([c for _,_,_,_,c,_ in ohlcv], dtype=float)
+                mtf_ctx = self._mtf_trend_context(arr, rt.get("timeframe", "1m"))
                 pattern = self.pattern_scanner.scan(ohlcv)
                 regime = self.regime_detector.detect(arr)
                 regime_name_raw = str(getattr(regime, "name", "unknown"))
@@ -298,6 +353,11 @@ class Engine:
                 feats["rr_ratio"] = float(rr_ratio)
                 feats["trend_strength"] = float(trend_strength)
                 feats["regime"] = regime_name
+                feats["trend_dir_15m"] = mtf_ctx.get("dir_15m", "NEUTRAL")
+                feats["trend_dir_60m"] = mtf_ctx.get("dir_60m", "NEUTRAL")
+                feats["trend_score_15m"] = float(mtf_ctx.get("score_15m", 0.0))
+                feats["trend_score_60m"] = float(mtf_ctx.get("score_60m", 0.0))
+                feats["trend_mtf_bias"] = float(mtf_ctx.get("bias", 0.0))
                 st_live = self.portfolio.stats()
                 win_rate = float(st_live.get("win_rate", 0.5))
                 sl_rate = float(st_live.get("sl", 0)) / max(1.0, float(st_live.get("total_closed", 0)))
@@ -451,6 +511,18 @@ class Engine:
                     cfg=ensemble_cfg,
                 )
                 ens_d = ens.as_dict()
+                # Multi-timeframe trend alignment (15m/60m) correction
+                p_raw = float(ens_d.get("p_up_3m", 0.5))
+                mtf_bias = float(feats.get("trend_mtf_bias", 0.0))
+                p_adj = max(0.0, min(1.0, p_raw + 0.15 * mtf_bias))
+                ens_d["p_up_3m"] = p_adj
+                ens_d["p_up_5m"] = max(0.0, min(1.0, float(ens_d.get("p_up_5m", 0.5)) + 0.10 * mtf_bias))
+                ens_d["signal_strength"] = abs(p_adj - 0.5) * 2.0
+                ens_d["confidence"] = max(p_adj, 1.0 - p_adj)
+                d60 = str(feats.get("trend_dir_60m", "NEUTRAL"))
+                dir_from_prob = "LONG" if p_adj >= 0.5 else "SHORT"
+                if d60 in ("LONG", "SHORT") and d60 != dir_from_prob and abs(float(feats.get("trend_score_60m", 0.0))) > 0.6:
+                    ens_d["no_trade_reason"] = ens_d.get("no_trade_reason") or "mtf_conflict"
                 ens_d["w_a"] = float(ensemble_cfg.get("w_a", 0.55))
                 ens_d["w_b"] = float(ensemble_cfg.get("w_b", 0.45))
                 ens_d["model_a_reliability"] = float(reliability)
@@ -509,6 +581,10 @@ class Engine:
                     "p_breakout_up": p3,
                     "p_breakout_down": 1.0 - float(p3),
                     "market_regime": feats.get("regime"),
+                    "trend_dir_15m": feats.get("trend_dir_15m"),
+                    "trend_dir_60m": feats.get("trend_dir_60m"),
+                    "trend_score_15m": feats.get("trend_score_15m"),
+                    "trend_score_60m": feats.get("trend_score_60m"),
                     "volatility_pct": float(getattr(regime, "volatility", 0.0)) * 100.0,
                     "atr_percentile": feats.get("atr_percentile", 0.0),
                     "decision_reasons": gate.get("reasons", [])[:3],

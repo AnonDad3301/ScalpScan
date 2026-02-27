@@ -20,5 +20,14 @@ class EngineTrainingInputsTests(unittest.TestCase):
         self.assertGreater(float((X[:, 0].max() - X[:, 0].min())), 1e-9)
 
 
+    def test_mtf_trend_context_detects_short_bias(self):
+        eng = Engine.__new__(Engine)
+        import numpy as np
+        close = np.linspace(120.0, 100.0, 80)
+        ctx = eng._mtf_trend_context(close, "3m")
+        self.assertEqual(ctx["dir_60m"], "SHORT")
+        self.assertLess(ctx["bias"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
