@@ -13,6 +13,15 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
     uncertainty_max = float(prof.get("uncertainty_max", 0.02))
     rr_min = float(prof.get("rr_min", 0.9))
     trend_strength_min = float(prof.get("trend_strength_min", 0.05))
+    ev_min = float(prof.get("ev_min", 0.0))
+    high_vol_conf_boost = float(prof.get("high_vol_conf_boost", 0.08))
+    cooldown_after_sl = int(prof.get("cooldown_after_sl", 3))
+    spread_rank_max = float(prof.get("spread_rank_max", 0.95))
+    latency_ms_max = float(prof.get("latency_ms_max", 1200.0))
+    high_conf_min = float(prof.get("high_confidence_min", 0.7))
+    enforce_auc_min = bool(prof.get("enforce_auc_min", False))
+    enforce_directional_agreement = bool(prof.get("enforce_directional_agreement", True))
+    enforce_high_confidence = bool(prof.get("enforce_high_confidence", False))
 
     rules = []
     reasons = []
@@ -39,9 +48,25 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
         auc_ok = auc >= min_auc
         if not auc_ok and conf >= auc_override_conf:
             add("MODEL_AUC_MIN", True, auc, min_auc, note=f"override by confidence>={auc_override_conf}")
+        elif not auc_ok and not enforce_auc_min:
+            add("MODEL_AUC_MIN", True, auc, min_auc, note="soft-check: enforce_auc_min=false")
         else:
             add("MODEL_AUC_MIN", auc_ok, auc, min_auc)
 
+    win_rate = float(features.get("win_rate", 0.5))
+    sl_rate = float(features.get("sl_rate", 0.0))
+    if sl_rate > 0.55:
+        conf_min = min(0.99, conf_min + 0.05)
+        rr_min += 0.10
+    elif win_rate > 0.62:
+        conf_min = max(0.50, conf_min - 0.02)
+
+    regime = str(features.get("regime", "unknown"))
+    if regime == "high_volatility":
+        conf_min = min(0.99, conf_min + high_vol_conf_boost)
+        rr_min += 0.1
+    if regime == "mean_reversion":
+        rr_min = max(0.6, rr_min - 0.15)
     add("CONFIDENCE_MIN", conf >= conf_min, conf, conf_min)
 
     pred = float(model_out.get("pred", 0.0))
@@ -52,6 +77,12 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
 
     spread_bps = float(features.get("spread_bps", features.get("spread", 0.0)))
     add("SPREAD_MAX", spread_bps <= spread_max, spread_bps, spread_max)
+
+    spread_rank = float(features.get("spread_pct_rank", 0.0))
+    add("SPREAD_RANK_MAX", spread_rank <= spread_rank_max, spread_rank, spread_rank_max)
+
+    latency_ms = float(features.get("latency_ms", 0.0))
+    add("LATENCY_MS_MAX", latency_ms <= latency_ms_max, latency_ms, latency_ms_max)
 
     volz = float(features.get("volz", abs(features.get("vol_z_last", 0.0))))
     add("VOLZ_MAX", volz <= volz_max, volz, volz_max)
@@ -64,6 +95,29 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
 
     trend_strength = float(features.get("trend_strength", 0.0))
     add("TREND_STRENGTH_MIN", trend_strength >= trend_strength_min, trend_strength, trend_strength_min)
+
+    add("REGIME_NOT_LOW_LIQ", regime != "low_liquidity", regime, "!=low_liquidity")
+
+    model_a_direction = str(model_out.get("model_a_direction", ""))
+    model_b_direction = str(model_out.get("model_b_direction", ""))
+    if (not enforce_directional_agreement) or (model_b_direction in ("", "NEUTRAL")):
+        agree = True
+    else:
+        agree = bool(model_a_direction) and (model_a_direction == model_b_direction)
+    add("DIRECTIONAL_AGREEMENT", agree, f"{model_a_direction}/{model_b_direction}", "same")
+
+    costs = float(features.get("costs_bps", 0.0)) / 10000.0
+    tp = float(features.get("tp_return", 0.0))
+    sl = float(features.get("sl_return", 0.0))
+    p = float(model_out.get("p_tp_first", 0.5))
+    ev = p * tp - (1.0 - p) * sl - costs
+    add("EV_POSITIVE", ev > ev_min, ev, ev_min)
+
+    sl_streak = int(features.get("sl_streak", 0))
+    add("COOLDOWN_AFTER_SL", sl_streak < cooldown_after_sl, sl_streak, cooldown_after_sl)
+
+    high_conf = float(model_out.get("confidence", 0.0)) >= high_conf_min
+    add("HIGH_CONFIDENCE", (high_conf or (not enforce_high_confidence)), float(model_out.get("confidence", 0.0)), high_conf_min, note="optional" if not enforce_high_confidence else None)
 
     decision = "PASS" if all(r["pass"] for r in rules) else "FAIL"
     return {
@@ -82,4 +136,7 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
         "forecast_uncertainty": unc,
         "rr_ratio": rr,
         "trend_strength": trend_strength,
+        "regime": regime,
+        "expected_value": ev,
+        "sl_streak": sl_streak,
     }

@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, json, time, logging, datetime, faulthandler, uuid
+import asyncio, json, time, logging, datetime, faulthandler, uuid, os
 import urllib.parse, urllib.request
 from typing import Any, Dict, Set
 
@@ -41,6 +41,15 @@ tele: Telemetry | None = None
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _deep_update(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
+    for k, v in (src or {}).items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _deep_update(dst[k], v)
+        else:
+            dst[k] = v
+    return dst
 
 
 
@@ -161,7 +170,13 @@ def append_event(es, rt: Dict[str, Any], stage: str, payload: Dict[str, Any], ru
     })
     try:
         if telegram_notifier is not None:
-            telegram_notifier.notify(stage=stage, payload=payload, symbol=symbol, timeframe=str(rt.get("timeframe", "")))
+            r = telegram_notifier.notify(stage=stage, payload=payload, symbol=symbol, timeframe=str(rt.get("timeframe", "")))
+            if isinstance(r, dict) and (not r.get("ok", False)) and r.get("reason") not in ("filtered_or_disabled", "empty_message"):
+                es.append({
+                    "event_id": str(uuid.uuid4()), "ts": now_ms(), "run_id": run_id, "service": "hub",
+                    "exchange": rt.get("exchange"), "market": rt.get("market"), "symbol": symbol,
+                    "timeframe": rt.get("timeframe"), "stage": "TELEGRAM_ERROR", "level": "ERROR", "payload": {"stage": stage, **r}
+                })
     except Exception:
         pass
 
@@ -175,53 +190,92 @@ class TelegramNotifier:
         self.send_signal = bool(tg.get("send_signal", True))
         self.send_trade_open = bool(tg.get("send_trade_open", True))
         self.send_trade_closed = bool(tg.get("send_trade_closed", True))
+        self.send_on_gate_fail = bool(tg.get("send_on_gate_fail", False))
+        self.min_interval_sec = float(tg.get("min_interval_sec", 2.0) or 0.0)
+        self.include_volatility = bool(tg.get("include_volatility", True))
+        self.include_positions = bool(tg.get("include_positions", True))
+        self.include_levels = bool(tg.get("include_levels", True))
+        self.include_probabilities = bool(tg.get("include_probabilities", True))
+        self.include_timing = bool(tg.get("include_timing", True))
+        self._last_sent_ts: Dict[str, int] = {}
 
-    def _should_send(self, stage: str) -> bool:
+    def reconfigure(self, cfg: Dict[str, Any]) -> None:
+        self.__init__(cfg)
+
+    def _should_send(self, stage: str, payload: Dict[str, Any]) -> bool:
         if not self.enabled or not self.bot_token or not self.chat_id:
             return False
         if stage == "SIGNAL":
-            return self.send_signal
-        if stage == "TRADE_OPEN":
-            return self.send_trade_open
-        if stage == "TRADE_CLOSED":
-            return self.send_trade_closed
-        return False
+            if not self.send_signal:
+                return False
+            g = payload.get("gate", {}) if isinstance(payload.get("gate"), dict) else {}
+            if (g.get("decision") == "FAIL") and (not self.send_on_gate_fail):
+                return False
+        elif stage == "TRADE_OPEN":
+            if not self.send_trade_open:
+                return False
+        elif stage == "TRADE_CLOSED":
+            if not self.send_trade_closed:
+                return False
+        else:
+            return False
+        now = now_ms()
+        prev = int(self._last_sent_ts.get(stage, 0))
+        if self.min_interval_sec > 0 and (now - prev) < int(self.min_interval_sec * 1000):
+            return False
+        self._last_sent_ts[stage] = now
+        return True
 
-    def notify(self, stage: str, payload: Dict[str, Any], symbol: str, timeframe: str) -> None:
-        if not self._should_send(stage):
-            return
+    def notify(self, stage: str, payload: Dict[str, Any], symbol: str, timeframe: str) -> Dict[str, Any]:
+        if not self._should_send(stage, payload):
+            return {"ok": False, "reason": "filtered_or_disabled"}
         text = self._format_message(stage, payload, symbol, timeframe)
         if not text:
-            return
+            return {"ok": False, "reason": "empty_message"}
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         data = urllib.parse.urlencode({"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}).encode("utf-8")
         req = urllib.request.Request(url, data=data, method="POST")
-        with urllib.request.urlopen(req, timeout=4.0):
-            pass
+        try:
+            with urllib.request.urlopen(req, timeout=6.0) as resp:
+                body = resp.read().decode("utf-8", errors="ignore")[:800]
+            return {"ok": True, "status": "sent", "response": body}
+        except Exception as e:
+            return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
 
     def _format_message(self, stage: str, p: Dict[str, Any], symbol: str, timeframe: str) -> str:
         if stage == "SIGNAL":
             g = p.get("gate", {}) if isinstance(p.get("gate"), dict) else {}
-            return (
-                f"📡 <b>Сигнал</b> {symbol} ({timeframe})\n"
-                f"Направление: <b>{p.get('direction')}</b>\n"
-                f"Pred/Conf: {p.get('pred')} / {p.get('confidence')}\n"
-                f"Gate: {g.get('decision')} | Причины: {','.join(g.get('reasons', []) or [])}\n"
-                f"Entry: {p.get('entry')} | SL: {p.get('sl')} | TP1: {p.get('tp1')} | TP2: {p.get('tp2')}"
-            )
+            lines = [
+                f"📡 <b>Сигнал</b> {symbol} ({timeframe})",
+                f"Направление: <b>{p.get('direction')}</b>",
+            ]
+            if self.include_probabilities:
+                lines.append(f"P3/P5: {p.get('p_up_3m')} / {p.get('p_up_5m')} | TP/SL-first: {p.get('p_tp_first')} / {p.get('p_sl_first')}")
+            lines.append(f"Pred/Conf: {p.get('pred')} / {p.get('confidence')}")
+            if self.include_volatility:
+                lines.append(f"Regime: {p.get('market_regime')} | Signal strength: {p.get('signal_strength')}")
+            lines.append(f"Gate: {g.get('decision')} | Причины: {','.join(g.get('reasons', []) or [])}")
+            if self.include_levels:
+                lines.append(f"Entry: {p.get('entry')} | SL: {p.get('sl')} | TP1: {p.get('tp1')} | TP2: {p.get('tp2')}")
+            if self.include_timing:
+                lines.append(f"ts={now_ms()}")
+            return "\n".join(lines)
         if stage == "TRADE_OPEN":
-            return (
-                f"🟢 <b>Позиция открыта</b> {symbol}\n"
-                f"Qty: {p.get('qty')} | Notional: {p.get('notional')}\n"
-                f"SL: {p.get('sl')} | TP1: {p.get('tp1')} | TP2: {p.get('tp2')}"
-            )
+            lines = [f"🟢 <b>Позиция открыта</b> {symbol}"]
+            if self.include_positions:
+                lines.append(f"Qty: {p.get('qty')} | Notional: {p.get('notional')}")
+                lines.append(f"SL: {p.get('sl')} | TP1: {p.get('tp1')} | TP2: {p.get('tp2')}")
+            if self.include_timing:
+                lines.append(f"ts={now_ms()}")
+            return "\n".join(lines)
         if stage == "TRADE_CLOSED":
-            return (
-                f"🔴 <b>Позиция закрыта</b> {symbol}\n"
-                f"Причина: {p.get('reason')}\n"
-                f"Entry: {p.get('entry')} | Exit: {p.get('exit')}\n"
-                f"PnL: <b>{p.get('pnl')}</b>"
-            )
+            lines = [f"🔴 <b>Позиция закрыта</b> {symbol}"]
+            if self.include_positions:
+                lines.append(f"Причина: {p.get('reason')}")
+                lines.append(f"Entry: {p.get('entry')} | Exit: {p.get('exit')} | PnL: <b>{p.get('pnl')}</b>")
+            if self.include_timing:
+                lines.append(f"ts={now_ms()}")
+            return "\n".join(lines)
         return ""
 
 
@@ -283,7 +337,15 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
     async def price_loop():
         while True:
             t0 = time.time()
-            syms = list(getattr(eng.portfolio, "positions", {}).keys())
+            open_syms = list(getattr(eng.portfolio, "positions", {}).keys())
+            if STATE.get("running", False):
+                try:
+                    uni_syms = list(eng.universe())
+                except Exception:
+                    uni_syms = []
+            else:
+                uni_syms = []
+            syms = list(dict.fromkeys(open_syms + uni_syms))[: int(rt.get("max_pairs", 50) or 50)]
             ws_connected=False; ws_stale_ms=None; ws_ticker_1s=None; ws_sub_ok=None; ws_sub_err=None
             try:
                 _, st = await ws_client.get_prices()
@@ -414,17 +476,17 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
                 append_event(es, rt, "POSITIONS_SNAPSHOT", pos_payload, run_id="price")
             except asyncio.TimeoutError:
                 status = "TIMEOUT"
-                append_event(es, rt, "PRICE_TIMEOUT", {"timeout_sec": price_timeout, "open_positions": len(syms)}, run_id="price", level="ERROR")
+                append_event(es, rt, "PRICE_TIMEOUT", {"timeout_sec": price_timeout, "open_positions": len(open_syms), "tracked_symbols": len(syms)}, run_id="price", level="ERROR")
             except Exception as e:
                 status = "ERROR"
                 append_event(es, rt, "PRICE_ERROR", {"err": str(e)}, run_id="price", level="ERROR")
 
             dt_ms = int((time.time()-t0)*1000)
             liveness["price"] = time.monotonic()
-            append_event(es, rt, "PRICE_TICK", {"open_positions": len(syms), "prices_n": len(prices), "dt_ms": dt_ms, "status": status, "symbols": syms[:50], "ws_connected": ws_connected, "ws_stale_ms": ws_stale_ms, "ws_ticker_1s": ws_ticker_1s, "ws_sub_ok": ws_sub_ok, "ws_sub_err": ws_sub_err}, run_id="price")
+            append_event(es, rt, "PRICE_TICK", {"open_positions": len(open_syms), "tracked_symbols": len(syms), "prices_n": len(prices), "dt_ms": dt_ms, "status": status, "symbols": syms[:50], "ws_connected": ws_connected, "ws_stale_ms": ws_stale_ms, "ws_ticker_1s": ws_ticker_1s, "ws_sub_ok": ws_sub_ok, "ws_sub_err": ws_sub_err}, run_id="price")
 
             try:
-                sp = tele.span_start("PRICE_TICK", trace_id="price_tick", symbol="*", open_positions=len(syms))
+                sp = tele.span_start("PRICE_TICK", trace_id="price_tick", symbol="*", open_positions=len(open_syms), tracked_symbols=len(syms))
                 tele.span_end(sp, status=status, prices_n=len(prices), dt_ms=dt_ms)
             except Exception:
                 pass
@@ -453,6 +515,11 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
         """Poll data/ui_commands.jsonl and set one-shot or sticky flags."""
         cmd_path = str(Path(__file__).resolve().parents[1] / "data" / "ui_commands.jsonl")
         last_pos = 0
+        if os.path.exists(cmd_path):
+            try:
+                last_pos = os.path.getsize(cmd_path)
+            except Exception:
+                last_pos = 0
         while True:
             try:
                 if os.path.exists(cmd_path):
@@ -483,18 +550,44 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
                             elif c=="rollback_model_b":
                                 STATE["rollback_model_b"]=True
                                 append_event(es, rt, "CMD", {"cmd": c}, run_id="cmd", level="INFO")
+                            elif c=="reload_config":
+                                try:
+                                    new_cfg = Config.load("config.yaml").raw
+                                    _deep_update(cfg, new_cfg)
+                                    eng.cfg = cfg
+                                    global telegram_notifier
+                                    if telegram_notifier is None:
+                                        telegram_notifier = TelegramNotifier(cfg)
+                                    else:
+                                        telegram_notifier.reconfigure(cfg)
+                                    append_event(es, rt, "CONFIG_RELOADED", {"status": "OK"}, run_id="cmd", level="INFO")
+                                    append_event(es, rt, "CMD", {"cmd": c, "status": "applied"}, run_id="cmd", level="INFO")
+                                except Exception as e:
+                                    append_event(es, rt, "CMD", {"cmd": c, "status": "error", "err": str(e)}, run_id="cmd", level="ERROR")
                             elif c=="send_test_telegram":
-                                append_event(es, rt, "SIGNAL", {
+                                test_payload = {
                                     "direction": "LONG",
                                     "pred": 0.77,
                                     "confidence": 0.81,
+                                    "p_up_3m": 0.72,
+                                    "p_up_5m": 0.69,
+                                    "p_tp_first": 0.66,
+                                    "p_sl_first": 0.34,
+                                    "signal_strength": 0.44,
+                                    "market_regime": "trend",
                                     "gate": {"decision": "PASS", "reasons": []},
                                     "entry": 100.0,
                                     "sl": 99.2,
                                     "tp1": 100.8,
                                     "tp2": 101.3,
-                                }, run_id="cmd", level="INFO", symbol="TEST/USDT")
-                                append_event(es, rt, "CMD", {"cmd": c, "status": "sent"}, run_id="cmd", level="INFO")
+                                }
+                                r = {"ok": False, "reason": "not_initialized"}
+                                try:
+                                    if telegram_notifier is not None:
+                                        r = telegram_notifier.notify(stage="SIGNAL", payload=test_payload, symbol="TEST/USDT", timeframe=str(rt.get("timeframe", "1m")))
+                                except Exception as e:
+                                    r = {"ok": False, "reason": str(e)}
+                                append_event(es, rt, "CMD", {"cmd": c, **r}, run_id="cmd", level="INFO" if r.get("ok") else "ERROR")
                         last_pos=f.tell()
             except Exception as e:
                 append_event(es, rt, "CMD_ERROR", {"err": str(e)}, run_id="cmd", level="ERROR")

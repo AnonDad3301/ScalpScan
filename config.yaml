@@ -47,6 +47,15 @@ model:
   auc_warmup_samples: 600
   auc_override_confidence_min: 0.70
   forward: 4
+  ensemble:
+    w_a: 0.55
+    w_b: 0.45
+    gray_zone: [0.45, 0.55]
+    platt:
+      a3: 1.0
+      b3: 0.0
+      a5: 1.0
+      b5: 0.0
 gate:
   profile: scalp
   profiles:
@@ -59,6 +68,15 @@ gate:
       uncertainty_max: 0.02
       rr_min: 0.9
       trend_strength_min: 0.05
+      ev_min: 0.0
+      high_vol_conf_boost: 0.08
+      cooldown_after_sl: 3
+      spread_rank_max: 0.95
+      latency_ms_max: 1200
+      high_confidence_min: 0.62
+      enforce_auc_min: false
+      enforce_directional_agreement: true
+      enforce_high_confidence: false
 execution:
   deposit_usd: 2000
   risk_usd: 50
@@ -89,6 +107,7 @@ storage:
   trades_db: data/trades.sqlite
 model_b:
   hf_id: ibm-research/patchtst-fm-r1
+  agreement_margin: 0.08
   cache_dir: data/hf_cache
   device: cpu
 pricing:
@@ -111,6 +130,13 @@ notifications:
     send_signal: true
     send_trade_open: true
     send_trade_closed: true
+    send_on_gate_fail: false
+    min_interval_sec: 2.0
+    include_volatility: true
+    include_positions: true
+    include_levels: true
+    include_probabilities: true
+    include_timing: true
 
 ui:
   theme: dark_green
