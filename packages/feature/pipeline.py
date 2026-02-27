@@ -42,6 +42,15 @@ def _lob_slope(levels, side: str) -> float:
     slope = np.polyfit(x, y, 1)[0]
     return float(slope if side == "bid" else -slope)
 
+
+
+def _rolling_vwap(close: np.ndarray, vol: np.ndarray) -> np.ndarray:
+    if close.size == 0:
+        return np.array([], dtype=float)
+    pv = np.cumsum(close * np.maximum(1e-12, vol))
+    vv = np.cumsum(np.maximum(1e-12, vol))
+    return pv / np.maximum(1e-12, vv)
+
 def compute(ohlcv: List[Tuple[int, float, float, float, float, float]], ob: Dict[str, Any]) -> Dict[str, float]:
     arr = np.array([[o, h, l, c, v] for _, o, h, l, c, v in ohlcv], dtype=float)
     high = arr[:, 1]
@@ -107,6 +116,32 @@ def compute(ohlcv: List[Tuple[int, float, float, float, float, float]], ob: Dict
     volume_delta = float(ob.get("volume_delta", ret_last * float(vol[-1] if len(vol) else 0.0)))
     volume_imbalance = float(ob.get("volume_imbalance", (volume_delta / max(1e-12, abs(volume_delta) + float(vol[-1] if len(vol) else 1.0)))))
 
+    # EPIC features: AVWAP / squeeze / sweep / CVD proxy
+    avwap = _rolling_vwap(close, vol)
+    avwap_dist = float((last - float(avwap[-1])) / max(1e-12, float(avwap[-1]))) if avwap.size else 0.0
+
+    squeeze_on = 0.0
+    if len(close) >= 22:
+        mid = float(np.mean(close[-20:]))
+        std = float(np.std(close[-20:]))
+        bb_w = max(1e-12, (mid + 2.0 * std) - (mid - 2.0 * std))
+        tr = np.maximum(high-low, np.maximum(np.abs(high-np.roll(close,1)), np.abs(low-np.roll(close,1))))
+        kc_w = max(1e-12, 2.0 * float(np.mean(tr[-20:])))
+        squeeze_on = 1.0 if bb_w < kc_w else 0.0
+
+    sweep = 0.0
+    if len(close) >= 22:
+        prev_h = float(np.max(high[-21:-1]))
+        prev_l = float(np.min(low[-21:-1]))
+        if float(high[-1]) > prev_h and float(close[-1]) < prev_h:
+            sweep = -1.0
+        elif float(low[-1]) < prev_l and float(close[-1]) > prev_l:
+            sweep = 1.0
+
+    bid_sz = sum(float(x[1]) for x in bids[:20] if len(x) >= 2)
+    ask_sz = sum(float(x[1]) for x in asks[:20] if len(x) >= 2)
+    cvd_proxy = float((bid_sz - ask_sz) / max(1e-12, bid_sz + ask_sz))
+
     return {
         "rsi": rsi(close, 14),
         "atr": atr_v,
@@ -138,4 +173,8 @@ def compute(ohlcv: List[Tuple[int, float, float, float, float, float]], ob: Dict
         "realized_vol": realized_vol,
         "entropy_returns": entropy,
         "hurst": hurst,
+        "avwap_dist": avwap_dist,
+        "squeeze_on": squeeze_on,
+        "liquidity_sweep": sweep,
+        "cvd_proxy": cvd_proxy,
     }

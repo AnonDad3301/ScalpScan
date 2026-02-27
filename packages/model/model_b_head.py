@@ -21,6 +21,8 @@ class ModelBHead:
         )
         self.fitted=False
         self.metrics=Metrics()
+        self.calib_a=1.0
+        self.calib_b=0.0
 
     def fit_eval(self, X: np.ndarray, y: np.ndarray) -> Metrics:
         self.metrics.samples=int(len(y))
@@ -33,19 +35,29 @@ class ModelBHead:
         self.fitted=True
         try:
             from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_score
-            p=self.proba(Xva)
+            p=self.proba(Xva, calibrated=False)
             self.metrics.auc=float(roc_auc_score(yva,p))
             self.metrics.pr_auc=float(average_precision_score(yva,p))
             self.metrics.acc=float(accuracy_score(yva,(p>=0.5).astype(int)))
+            # lightweight calibration: align mean log-odds to base rate
+            eps=1e-6
+            base=float(np.mean(yva))
+            mp=float(np.mean(p))
+            base=np.clip(base, eps, 1.0-eps)
+            mp=np.clip(mp, eps, 1.0-eps)
+            self.calib_a=1.0
+            self.calib_b=float(np.log(base/(1.0-base)) - np.log(mp/(1.0-mp)))
         except Exception:
             pass
         return self.metrics
 
-    def proba(self, X: np.ndarray) -> np.ndarray:
+    def proba(self, X: np.ndarray, calibrated: bool = True) -> np.ndarray:
         if not self.fitted:
             return np.full((len(X),), 0.5, dtype=float)
         z=self.clf.decision_function(np.asarray(X, dtype=float))
         z=np.clip(z, -60.0, 60.0)
+        if calibrated:
+            z = self.calib_a * z + self.calib_b
         return 1.0/(1.0+np.exp(-z))
 
     def infer_one(self, feats: Dict[str,Any]) -> float:

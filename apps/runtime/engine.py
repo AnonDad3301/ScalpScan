@@ -39,6 +39,9 @@ def mk_event(base: Dict[str, Any], stage: str, level: str, payload: Dict[str, An
         "stage": stage,
         "level": level,
         "payload": payload,
+        "schema_version": 2,
+        "source": "runtime",
+        "tags": {"stage": stage},
     }
 
 def label_forward(close: np.ndarray, forward: int) -> np.ndarray:
@@ -400,6 +403,7 @@ class Engine:
                     horizon_bars=max(3, min(5, fwd)),
                     tp_atr_mult=float(self.cfg.get("execution", {}).get("exits", {}).get("tp1_atr_mult", 1.1)),
                     sl_atr_mult=float(self.cfg.get("execution", {}).get("exits", {}).get("sl_atr_mult", 1.2)),
+                    costs_bps=float(self.cfg.get("execution", {}).get("fees_bps", 0.0) or 0.0) + float(self.cfg.get("execution", {}).get("slippage_bps", 0.0) or 0.0),
                 )
                 X=self._build_model_a_matrix(ohlcv, ob)
 
@@ -552,6 +556,13 @@ class Engine:
                 self.es.append(mk_event(env,"GATE_DECISION","INFO",gate))
                 if gate.get("decision") == "PASS":
                     scan_stats["gate_pass"] += 1
+                else:
+                    self.es.append(mk_event(env, "LEARN_ON_REJECT", "INFO", {
+                        "enabled": True,
+                        "reasons": gate.get("reasons", [])[:5],
+                        "pred": float(mout.get("pred", 0.0)),
+                        "confidence": float(mout.get("confidence", 0.0)),
+                    }))
 
                 direction = str(ens_d.get("direction", "NEUTRAL"))
                 if ens_d.get("no_trade_reason"):
