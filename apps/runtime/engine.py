@@ -363,9 +363,15 @@ class Engine:
                     "signal_strength": ens_d.get("signal_strength", 0.0),
                     "p_up_3m": ens_d.get("p_up_3m", 0.5),
                     "p_up_5m": ens_d.get("p_up_5m", 0.5),
+                    "p_down_3m": 1.0 - float(ens_d.get("p_up_3m", 0.5)),
+                    "p_down_5m": 1.0 - float(ens_d.get("p_up_5m", 0.5)),
                     "p_tp_first": ens_d.get("p_tp_first", 0.5),
                     "p_sl_first": ens_d.get("p_sl_first", 0.5),
+                    "p_breakout_up": p3,
+                    "p_breakout_down": 1.0 - float(p3),
                     "market_regime": feats.get("regime"),
+                    "volatility_pct": float(getattr(regime, "volatility", 0.0)) * 100.0,
+                    "atr_percentile": feats.get("atr_percentile", 0.0),
                     "decision_reasons": gate.get("reasons", [])[:3],
                     "ev": float(gate.get("expected_value", 0.0)),
                     "top_features": sorted([
@@ -383,7 +389,7 @@ class Engine:
                     res=self.portfolio.open(now_ms(), sym, direction, last_close, feats["atr"])
                     if res.get("result") == "OK":
                         self._open_feature_bank[sym] = np.asarray(x_last, dtype=float)
-                    self.es.append(mk_event(env,"TRADE_OPEN","INFO",res))
+                    self.es.append(mk_event(env,"TRADE_OPEN","INFO",{**res, "symbol": sym, "side": direction, "entry": last_close}))
 
             except Exception as e:
                 self.es.append(mk_event(env,"ERROR","ERROR",{"error":str(e)}))

@@ -198,6 +198,9 @@ class TelegramNotifier:
         self.include_probabilities = bool(tg.get("include_probabilities", True))
         self.include_timing = bool(tg.get("include_timing", True))
         self._last_sent_ts: Dict[str, int] = {}
+        self._sent_event_ids: set[str] = set()
+        self._sent_event_order: list[str] = []
+        self._sent_event_limit = int(tg.get("dedupe_cache_size", 4000) or 4000)
 
     def reconfigure(self, cfg: Dict[str, Any]) -> None:
         self.__init__(cfg)
@@ -242,6 +245,23 @@ class TelegramNotifier:
         except Exception as e:
             return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
 
+    def notify_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        event_id = str(event.get("event_id") or "")
+        if event_id:
+            if event_id in self._sent_event_ids:
+                return {"ok": False, "reason": "already_sent"}
+            self._sent_event_ids.add(event_id)
+            self._sent_event_order.append(event_id)
+            if len(self._sent_event_order) > self._sent_event_limit:
+                old = self._sent_event_order.pop(0)
+                self._sent_event_ids.discard(old)
+        return self.notify(
+            stage=str(event.get("stage", "")),
+            payload=(event.get("payload") if isinstance(event.get("payload"), dict) else {}),
+            symbol=str(event.get("symbol", "*") or "*"),
+            timeframe=str(event.get("timeframe", "") or ""),
+        )
+
     def _format_message(self, stage: str, p: Dict[str, Any], symbol: str, timeframe: str) -> str:
         if stage == "SIGNAL":
             g = p.get("gate", {}) if isinstance(p.get("gate"), dict) else {}
@@ -250,10 +270,14 @@ class TelegramNotifier:
                 f"Направление: <b>{p.get('direction')}</b>",
             ]
             if self.include_probabilities:
-                lines.append(f"P3/P5: {p.get('p_up_3m')} / {p.get('p_up_5m')} | TP/SL-first: {p.get('p_tp_first')} / {p.get('p_sl_first')}")
+                lines.append(f"Вер. LONG 3m/5m: {p.get('p_up_3m')} / {p.get('p_up_5m')}")
+                lines.append(f"Вер. SHORT 3m/5m: {p.get('p_down_3m')} / {p.get('p_down_5m')}")
+                lines.append(f"TP-first/SL-first: {p.get('p_tp_first')} / {p.get('p_sl_first')}")
+                lines.append(f"Пробой вверх/вниз: {p.get('p_breakout_up')} / {p.get('p_breakout_down')}")
             lines.append(f"Pred/Conf: {p.get('pred')} / {p.get('confidence')}")
             if self.include_volatility:
                 lines.append(f"Regime: {p.get('market_regime')} | Signal strength: {p.get('signal_strength')}")
+                lines.append(f"Volatility: {p.get('volatility_pct')}% | ATR pct-rank: {p.get('atr_percentile')}")
             lines.append(f"Gate: {g.get('decision')} | Причины: {','.join(g.get('reasons', []) or [])}")
             if self.include_levels:
                 lines.append(f"Entry: {p.get('entry')} | SL: {p.get('sl')} | TP1: {p.get('tp1')} | TP2: {p.get('tp2')}")
@@ -262,6 +286,7 @@ class TelegramNotifier:
             return "\n".join(lines)
         if stage == "TRADE_OPEN":
             lines = [f"🟢 <b>Позиция открыта</b> {symbol}"]
+            lines.append(f"Сторона: {p.get('side')} | Entry: {p.get('entry')}")
             if self.include_positions:
                 lines.append(f"Qty: {p.get('qty')} | Notional: {p.get('notional')}")
                 lines.append(f"SL: {p.get('sl')} | TP1: {p.get('tp1')} | TP2: {p.get('tp2')}")
@@ -506,6 +531,16 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
                 "MODEL_B_LOAD_START","MODEL_B_LOAD_END","MODEL_B_INFERRED",
                 "MODEL_B_DATASET_APPEND","MODEL_B_STATUS","MODEL_B_RETRAIN","MODEL_B_RETRAIN_SKIPPED","MODEL_B_TRAINING_STATUS","MODEL_B_PROMOTED"
             )]
+            try:
+                if telegram_notifier is not None:
+                    for e in reversed(interesting):
+                        if e.get("stage") not in ("SIGNAL", "TRADE_OPEN", "TRADE_CLOSED"):
+                            continue
+                        r = telegram_notifier.notify_event(e)
+                        if isinstance(r, dict) and (not r.get("ok", False)) and r.get("reason") not in ("filtered_or_disabled", "empty_message", "already_sent"):
+                            append_event(es, rt, "TELEGRAM_ERROR", {"stage": e.get("stage"), "event_id": e.get("event_id"), **r}, run_id="events", level="ERROR", symbol=str(e.get("symbol", "*")))
+            except Exception:
+                pass
             liveness["events"] = time.monotonic()
             await broadcast({"type": "events", "ts": now_ms(), "events": list(reversed(interesting))[-350:]})
             await asyncio.sleep(1.0)
