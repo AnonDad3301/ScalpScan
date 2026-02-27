@@ -605,7 +605,10 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
                                 continue
                             STATE["last_cmd_id"]=cid
                             c=cmd.get("cmd")
-                            if c=="force_model_b_retrain":
+                            if c in ("run_preflight", "start", "stop", "sync_symbols", "get_symbols"):
+                                await COMMANDS.enqueue(cmd)
+                                append_event(es, rt, "CMD", {"cmd": c, "status": "queued"}, run_id="cmd", level="INFO")
+                            elif c=="force_model_b_retrain":
                                 STATE["force_model_b_retrain"]=True
                                 append_event(es, rt, "CMD", {"cmd": c}, run_id="cmd", level="INFO")
                             elif c=="disable_model_b_training":
