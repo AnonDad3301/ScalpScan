@@ -107,10 +107,38 @@ class Engine:
     def universe(self) -> List[str]:
         u=self.cfg["universe"]; rt=self.cfg["runtime"]
         limit=int(rt.get("max_pairs",50))
+        custom = list(u.get("custom_symbols", []) or [])
+
+        def _dedup_fill(primary: List[str], fallback: List[str], cap: int) -> List[str]:
+            out: List[str] = []
+            seen = set()
+            for s in (primary or []):
+                if s in seen:
+                    continue
+                seen.add(s)
+                out.append(s)
+                if len(out) >= cap:
+                    return out
+            for s in (fallback or []):
+                if s in seen:
+                    continue
+                seen.add(s)
+                out.append(s)
+                if len(out) >= cap:
+                    return out
+            return out
+
         if u.get("mode","db")=="db":
-            top=self.symdb.top_symbols(rt["exchange"], rt["market"], limit, quote=u.get("quote"), min_volume=float(u.get("min_volume",0)))
-            return top if top else u.get("custom_symbols",[])[:limit]
-        return u.get("custom_symbols",[])[:limit]
+            quote = u.get("quote")
+            min_volume = float(u.get("min_volume",0))
+            top=self.symdb.top_symbols(rt["exchange"], rt["market"], limit, quote=quote, min_volume=min_volume)
+            # Production safeguard: if DB liquidity filter becomes too strict and returns
+            # very few rows, broaden with quote-only rows and static fallback symbols.
+            if len(top) < limit:
+                top_relaxed = self.symdb.top_symbols(rt["exchange"], rt["market"], limit * 3, quote=quote, min_volume=0.0)
+                top = _dedup_fill(top, top_relaxed, limit)
+            return _dedup_fill(top, custom, limit)
+        return custom[:limit]
 
     def tick(self) -> str:
         price_source=str(self.cfg.get('pricing',{}).get('price_source','last'))
@@ -134,6 +162,15 @@ class Engine:
 
         prices: Dict[str, float] = {}
         market_ctx: Dict[str, Dict[str, Any]] = {}
+        scan_stats = {
+            "symbols_total": len(symbols),
+            "symbols_tick": len(tick_symbols),
+            "processed": 0,
+            "inv_fail": 0,
+            "gate_pass": 0,
+            "errors": 0,
+            "samples_added": 0,
+        }
 
         for sym in tick_symbols:
             env=dict(base); env["symbol"]=sym
@@ -180,6 +217,7 @@ class Engine:
                 inv=inv_check(feats, self.cfg["features"]["invariants"])
                 self.es.append(mk_event(env,"FEATURES_COMPUTED","INFO",{"features":feats,"invariants":inv}))
                 if not inv_ok(inv):
+                    scan_stats["inv_fail"] += 1
                     self.es.append(mk_event(env,"GATE_DECISION","INFO",{"decision":"FAIL","reasons":["INVARIANTS_OK"]}))
                     continue
 
@@ -276,6 +314,7 @@ class Engine:
                 X=np.array([[feats["rsi"],feats["atr"],feats["adx"],feats["ob_imb"],feats["spread"]] for _ in range(len(arr))], dtype=float)
 
                 added=self.trainer.add_samples(X[:-fwd], y[:-fwd])
+                scan_stats["samples_added"] += int(added)
                 pass  # retrain throttled
 
                 x_last=X[-1]
@@ -381,6 +420,8 @@ class Engine:
                      "auc_override_confidence_min": float(self.cfg["model"].get("auc_override_confidence_min",0.70))}
                 )
                 self.es.append(mk_event(env,"GATE_DECISION","INFO",gate))
+                if gate.get("decision") == "PASS":
+                    scan_stats["gate_pass"] += 1
 
                 direction = str(ens_d.get("direction", "NEUTRAL"))
                 if ens_d.get("no_trade_reason"):
@@ -436,7 +477,10 @@ class Engine:
                         self._open_feature_bank[sym] = np.asarray(x_last, dtype=float)
                     self.es.append(mk_event(env,"TRADE_OPEN","INFO",{**res, "symbol": sym, "side": direction, "entry": last_close}))
 
+                scan_stats["processed"] += 1
+
             except Exception as e:
+                scan_stats["errors"] += 1
                 self.es.append(mk_event(env,"ERROR","ERROR",{"error":str(e)}))
         # retrain model at most once per interval (prevents stalls)
 
@@ -550,6 +594,12 @@ class Engine:
         self.es.append(mk_event(base, "POSITIONS_SNAPSHOT", "INFO", pos_payload))
 
         self.es.append(mk_event(base, "RUN_DONE", "INFO", {"run_id": run_id}))
+        self.es.append(mk_event(base, "SCAN_EFFICIENCY", "INFO", {
+            **scan_stats,
+            "coverage_pct": float(100.0 * scan_stats["symbols_tick"] / max(1, scan_stats["symbols_total"])),
+            "pass_rate_pct": float(100.0 * scan_stats["gate_pass"] / max(1, scan_stats["processed"])),
+            "error_rate_pct": float(100.0 * scan_stats["errors"] / max(1, scan_stats["symbols_tick"])),
+        }))
         # Model-B status heartbeat
         try:
             st = self.ds_builder.stats() if hasattr(self,'ds_builder') else {}
