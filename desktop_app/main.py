@@ -7,8 +7,6 @@ from typing import Any, Dict, List, Optional
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
 from PySide6.QtCore import Qt, Signal
-import websockets
-from websockets.legacy.client import connect as legacy_connect
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -36,7 +34,8 @@ def write_cmd(cfg: Dict[str, Any], cmd: str, **kwargs) -> None:
     with fp.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
-class WSClient(QtCore.QThread):
+class WSClient(QtCore.QObject):
+    """File-command bridge (no network websocket client)."""
     message = Signal(dict)
     status = Signal(str)
     connected = Signal(bool)
@@ -44,63 +43,22 @@ class WSClient(QtCore.QThread):
     def __init__(self, url: str):
         super().__init__()
         self.url = url
-        self._stop = False
-        self._out_q: Optional[asyncio.Queue] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._running = False
+
+    def start(self):
+        self._running = True
+        self.connected.emit(False)
+        self.status.emit("WS disabled: using file commands (ui_commands.jsonl)")
 
     def stop(self):
-        self._stop = True
-        if self._loop:
-            self._loop.call_soon_threadsafe(lambda: None)
+        self._running = False
+
+    def wait(self, _ms: int = 0):
+        return True
 
     def send_cmd(self, cmd: str, **kwargs):
-        payload = {"type":"cmd","ts":int(time.time()*1000),"cmd":cmd}
-        payload.update(kwargs)
-        if self._loop and self._out_q:
-            def _put():
-                try:
-                    self._out_q.put_nowait(payload)
-                except Exception:
-                    pass
-            self._loop.call_soon_threadsafe(_put)
+        write_cmd({}, cmd, **kwargs)
 
-    def run(self):
-        asyncio.run(self._main())
-
-    async def _main(self):
-        self._loop = asyncio.get_running_loop()
-        self._out_q = asyncio.Queue()
-        while not self._stop:
-            try:
-                self.status.emit(f"WS connect: {self.url}")
-                async with legacy_connect(self.url, ping_interval=None, ping_timeout=None) as ws:
-                    self.connected.emit(True)
-                    self.status.emit("WS connected")
-
-                    async def sender():
-                        while not self._stop:
-                            msg = await self._out_q.get()
-                            try:
-                                await ws.send(json.dumps(msg, ensure_ascii=False))
-                            except Exception:
-                                break
-
-                    send_task = asyncio.create_task(sender())
-                    try:
-                        async for raw in ws:
-                            if self._stop:
-                                break
-                            try:
-                                self.message.emit(json.loads(raw))
-                            except Exception:
-                                continue
-                    finally:
-                        send_task.cancel()
-                        self.connected.emit(False)
-            except Exception as e:
-                self.connected.emit(False)
-                self.status.emit(f"WS reconnect in 1s: {e}")
-                await asyncio.sleep(1.0)
 
 class Table(QtWidgets.QTableWidget):
     def __init__(self, headers: List[str]):
@@ -567,7 +525,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # SQLite polling (IMPORTANT: tail() returns newest first)
     def poll_sqlite(self):
-        tail = self.es.tail(2500)  # newest first
+        tail = self.es.tail(12000)  # newest first (wider window for analytics)
         self.events = list(reversed(tail))  # for tables (oldest->newest)
 
         for e in tail:
@@ -597,7 +555,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def refresh_ui(self):
         now = int(time.time()*1000)
         age = (now - self.last_ws_msg_ts) if self.last_ws_msg_ts else None
-        self.lbl_live.setText(f"Live: WS={'OK' if self.ws_connected else 'NO'} | last_msg={age}ms" if age is not None else f"Live: WS={'OK' if self.ws_connected else 'NO'}")
+        self.lbl_live.setText(f"Live: {'WS OK' if self.ws_connected else 'File-commands mode'} | last_msg={age}ms" if age is not None else f"Live: {'WS OK' if self.ws_connected else 'File-commands mode'}")
 
         self.lbl_pf.setText("Предпроверка: " + ("OK ✅" if self.preflight_ok else "НЕ ПРОЙДЕНА ❌"))
         self.tbl_pf.set_rows([[r.get("name"), "OK" if r.get("ok") else "FAIL", r.get("details","")] for r in (self.preflight_report or [])])
