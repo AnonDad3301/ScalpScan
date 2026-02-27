@@ -24,6 +24,20 @@ def fmt_ts(ts_ms: Any) -> str:
         return ""
 
 
+def _sparkline(values: List[float], width: int = 24) -> str:
+    if not values:
+        return "—"
+    vals = values[-width:]
+    lo = min(vals); hi = max(vals)
+    bars = "▁▂▃▄▅▆▇█"
+    if hi - lo < 1e-12:
+        return bars[0] * len(vals)
+    out = []
+    for v in vals:
+        idx = int((v - lo) / (hi - lo) * (len(bars) - 1))
+        out.append(bars[max(0, min(len(bars)-1, idx))])
+    return "".join(out)
+
 
 def write_cmd(cfg: Dict[str, Any], cmd: str, **kwargs) -> None:
     """Write UI command to data/ui_commands.jsonl for hub cmd_loop consumption."""
@@ -348,9 +362,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pb_signal_pass=QtWidgets.QProgressBar(); self.pb_signal_pass.setFormat("Signal PASS rate: %p%")
         self.pb_trade_win=QtWidgets.QProgressBar(); self.pb_trade_win.setFormat("Trade win rate: %p%")
         self.pb_scan_cov=QtWidgets.QProgressBar(); self.pb_scan_cov.setFormat("Scan coverage: %p%")
+        self.lbl_graph_scan=QLabel("Scan trend: —")
+        self.lbl_graph_signal=QLabel("Signal trend: —")
         for b in (self.pb_signal_pass,self.pb_trade_win,self.pb_scan_cov):
             b.setRange(0,100); b.setValue(0); bars.addWidget(b)
         lay.addLayout(bars)
+        lay.addWidget(self.lbl_graph_scan)
+        lay.addWidget(self.lbl_graph_signal)
 
         split=QHBoxLayout()
         left=QVBoxLayout(); right=QVBoxLayout()
@@ -607,7 +625,7 @@ class MainWindow(QtWidgets.QMainWindow):
         modelb_rows=[]; mlops_rows=[]; levels_rows=[]; perf_rows=[]
         modelb_status=None
         dataset_rows=None
-        for e in self.events[-1400:]:
+        for e in self.events[-10000:]:
             ts=fmt_ts(e.get("ts")); sym=e.get("symbol"); stg=e.get("stage"); lvl=e.get("level"); payload=e.get("payload",{})
             if stg=="SIGNAL":
                 gate=payload.get("gate",{}) or {}
@@ -677,7 +695,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pb_auc.setValue(0)
 
         ds_path = ""
-        for e in reversed(self.events[-2000:]):
+        for e in reversed(self.events[-12000:]):
             if e.get("stage") == "MODEL_B_STATUS":
                 ds_path = str((e.get("payload") or {}).get("dataset_path", ""))
                 break
@@ -685,7 +703,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pos_rate = float((modelb_status or {}).get("dataset_pos_rate", 0.0) or 0.0)
         self.lbl_ds.setText(f"Dataset: {rows_val} rows | positive_rate={pos_rate:.2%}")
         last_ds_ts = ""
-        for e in reversed(self.events[-2000:]):
+        for e in reversed(self.events[-12000:]):
             if e.get("stage") == "MODEL_B_DATASET_APPEND":
                 last_ds_ts = fmt_ts(e.get("ts"))
                 break
@@ -712,7 +730,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_perf.setText(f"Сделки: всего={total_closed}, прибыльных={wins}, убыточных={loss}, SL={sl}, BE={be}, win_rate={win_rate:.1%} | Model-B progress={mb_prog:.0%}, reason={mb_reason}")
 
         prob_rows=[]
-        for e in self.events[-1500:]:
+        for e in self.events[-12000:]:
             if e.get("stage") == "SHORT_TERM_LEVEL_PROB":
                 p=e.get("payload",{})
                 prob_rows.append([fmt_ts(e.get("ts")), e.get("symbol"), f"{float(p.get('p_up_3m',0.0)):.2%}", f"{float(p.get('p_up_5m',0.0)):.2%}", "—", "—", "—", "—", "—", f"{float(p.get('ret_3m',0.0)):.4f}", f"{float(p.get('ret_5m',0.0)):.4f}"])
@@ -727,7 +745,7 @@ class MainWindow(QtWidgets.QMainWindow):
         trade_closed_total = 0
         close_sl = 0
         close_tp = 0
-        for e in self.events[-6000:]:
+        for e in self.events[-12000:]:
             stg = e.get("stage")
             p = e.get("payload") or {}
             if stg == "SIGNAL":
@@ -754,7 +772,7 @@ class MainWindow(QtWidgets.QMainWindow):
         scan_pass = 0.0
         scan_err = 0.0
         scan_rows = []
-        for e in self.events[-2000:]:
+        for e in self.events[-12000:]:
             if e.get("stage") == "SCAN_EFFICIENCY":
                 p = e.get("payload") or {}
                 scan_cov = float(p.get("coverage_pct", scan_cov) or 0.0)
@@ -800,6 +818,14 @@ class MainWindow(QtWidgets.QMainWindow):
             ["Scanner error rate", f"{scan_err:.1f}%"],
         ])
         self.tbl_stats_scan.set_rows(scan_rows[-120:])
+        scan_pass_hist = [float(r[2]) for r in scan_rows[-40:] if isinstance(r[2], str)]
+        signal_hist = []
+        for e in self.events[-12000:]:
+            if e.get("stage") == "SIGNAL":
+                g = (e.get("payload") or {}).get("gate") or {}
+                signal_hist.append(100.0 if str(g.get("decision","")) == "PASS" else 0.0)
+        self.lbl_graph_scan.setText(f"Scan trend: {_sparkline(scan_pass_hist)}")
+        self.lbl_graph_signal.setText(f"Signal PASS trend: {_sparkline(signal_hist)}")
 
         # last command feedback (telegram test / reload config)
         for e in reversed(self.events[-500:]):
