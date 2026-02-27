@@ -3,7 +3,7 @@ import asyncio, json, time
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Set, Tuple
 
-import websockets
+from websockets.legacy.client import connect as legacy_connect
 
 @dataclass
 class WSState:
@@ -48,7 +48,7 @@ class BybitPublicWS:
         ping_every = 20
         while not stop_evt.is_set():
             try:
-                async with websockets.connect(self.url, ping_interval=None, ping_timeout=None) as ws:
+                async with legacy_connect(self.url, ping_interval=None, ping_timeout=None) as ws:
                     now = int(time.time()*1000)
                     self.state.connected = True
                     self.state.last_msg_ms = now
@@ -167,10 +167,10 @@ class BybitPublicWS:
                 return
 
 
-async def request_resubscribe(self) -> None:
-    async with self._lock:
-        self._force_resub = True
+    async def request_resubscribe(self) -> None:
+        async with self._lock:
+            self._force_resub = True
 
-async def request_reconnect(self) -> None:
-    async with self._lock:
-        self._force_reconnect = True
+    async def request_reconnect(self) -> None:
+        async with self._lock:
+            self._force_reconnect = True
