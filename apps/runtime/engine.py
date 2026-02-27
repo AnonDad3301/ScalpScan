@@ -567,7 +567,6 @@ class Engine:
 
                 direction = str(ens_d.get("direction", "NEUTRAL"))
                 if ens_d.get("no_trade_reason"):
-                    gate["decision"] = "FAIL"
                     gate.setdefault("reasons", []).append(f"ENSEMBLE_{str(ens_d.get('no_trade_reason', 'no_trade')).upper()}")
 
                 sl_mult = float(ex_cfg.get("sl_atr_mult", 1.2) or 1.2)

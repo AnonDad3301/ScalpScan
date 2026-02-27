@@ -23,7 +23,7 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
     enforce_directional_agreement = bool(prof.get("enforce_directional_agreement", True))
     enforce_high_confidence = bool(prof.get("enforce_high_confidence", False))
     enforce_model_samples_min = bool(prof.get("enforce_model_samples_min", False))
-    enforce_mtf_alignment = bool(prof.get("enforce_mtf_alignment", True))
+    enforce_mtf_alignment = bool(prof.get("enforce_mtf_alignment", False))
 
     rules = []
     reasons = []

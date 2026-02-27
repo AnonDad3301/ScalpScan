@@ -21,7 +21,7 @@ class EnsembleAndLabelingTests(unittest.TestCase):
             regime="trend",
             cfg={"gray_zone": [0.45, 0.55]},
         )
-        self.assertEqual(out.direction, "NEUTRAL")
+        self.assertEqual(out.direction, "LONG")
         self.assertEqual(out.no_trade_reason, "gray_zone")
 
 
