@@ -179,6 +179,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tab_mlops()
         self._tab_levels()
         self._tab_performance()
+        self._tab_analytics()
         self._tab_settings()
         self._tab_logs()
 
@@ -347,6 +348,47 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tbl_prob=SimpleTable(["Время","Символ","P(up 3m)","P(up 5m)","TP-first","SL-first","Signal","EV","Regime","ret_3m","ret_5m"])
         lay.addWidget(self.tbl_prob)
         self.tabs.addTab(w, "Эффективность")
+
+    def _kpi_card(self, title: str) -> QtWidgets.QLabel:
+        lab = QLabel(f"{title}: —")
+        lab.setStyleSheet("font-size:16px; font-weight:700; background:#1f2937; color:#e5e7eb; border-radius:10px; padding:10px;")
+        return lab
+
+    def _tab_analytics(self):
+        w=QWidget(); lay=QVBoxLayout(w)
+        info=QLabel("Статистика системы: качество сканирования, сигналы, открытие/закрытие сделок, обучение моделей. Обновляется из events.sqlite в реальном времени.")
+        info.setWordWrap(True); lay.addWidget(info)
+
+        cards=QHBoxLayout()
+        self.kpi_sig_total=self._kpi_card("Сигналы")
+        self.kpi_sig_pass=self._kpi_card("PASS")
+        self.kpi_opened=self._kpi_card("Открыто")
+        self.kpi_closed=self._kpi_card("Закрыто")
+        self.kpi_winrate=self._kpi_card("WinRate")
+        for c in (self.kpi_sig_total,self.kpi_sig_pass,self.kpi_opened,self.kpi_closed,self.kpi_winrate):
+            cards.addWidget(c)
+        lay.addLayout(cards)
+
+        bars=QHBoxLayout()
+        self.pb_signal_pass=QtWidgets.QProgressBar(); self.pb_signal_pass.setFormat("Signal PASS rate: %p%")
+        self.pb_trade_win=QtWidgets.QProgressBar(); self.pb_trade_win.setFormat("Trade win rate: %p%")
+        self.pb_scan_cov=QtWidgets.QProgressBar(); self.pb_scan_cov.setFormat("Scan coverage: %p%")
+        for b in (self.pb_signal_pass,self.pb_trade_win,self.pb_scan_cov):
+            b.setRange(0,100); b.setValue(0); bars.addWidget(b)
+        lay.addLayout(bars)
+
+        split=QHBoxLayout()
+        left=QVBoxLayout(); right=QVBoxLayout()
+        self.tbl_stats_models=SimpleTable(["Метрика","Значение"])
+        self.tbl_stats_trades=SimpleTable(["Метрика","Значение"])
+        self.tbl_stats_scan=SimpleTable(["Время","Coverage %","Pass %","Error %","Processed","Errors"])
+        left.addWidget(QLabel("Модели/обучение")); left.addWidget(self.tbl_stats_models)
+        right.addWidget(QLabel("Торговля/сигналы")); right.addWidget(self.tbl_stats_trades)
+        split.addLayout(left); split.addLayout(right)
+        lay.addLayout(split)
+        lay.addWidget(QLabel("История сканера (последние тики)"))
+        lay.addWidget(self.tbl_stats_scan)
+        self.tabs.addTab(w, "Статистика")
 
     def _tab_settings(self):
         w=QWidget(); lay=QVBoxLayout(w)
@@ -701,6 +743,88 @@ class MainWindow(QtWidgets.QMainWindow):
                 prob_rows.append([fmt_ts(e.get("ts")), e.get("symbol"), f"{float(p.get('p_up_3m',0.0)):.2%}", f"{float(p.get('p_up_5m',0.0)):.2%}", "—", "—", "—", "—", "—", f"{float(p.get('ret_3m',0.0)):.4f}", f"{float(p.get('ret_5m',0.0)):.4f}"])
         merged = (prob_rows + perf_rows)[-400:]
         self.tbl_prob.set_rows(merged[-250:])
+
+        # analytics tab (aggregated system statistics)
+        signal_total = 0
+        signal_pass = 0
+        signal_fail = 0
+        trade_open_total = 0
+        trade_closed_total = 0
+        close_sl = 0
+        close_tp = 0
+        for e in self.events[-6000:]:
+            stg = e.get("stage")
+            p = e.get("payload") or {}
+            if stg == "SIGNAL":
+                signal_total += 1
+                g = p.get("gate") or {}
+                if str(g.get("decision", "")).upper() == "PASS":
+                    signal_pass += 1
+                else:
+                    signal_fail += 1
+            elif stg == "TRADE_OPEN":
+                if str(p.get("result", "OK")) == "OK":
+                    trade_open_total += 1
+            elif stg == "TRADE_CLOSED":
+                trade_closed_total += 1
+                r = str(p.get("reason", ""))
+                if r == "SL":
+                    close_sl += 1
+                elif r in ("TP1", "TP2"):
+                    close_tp += 1
+
+        signal_pass_rate = (100.0 * signal_pass / max(1, signal_total))
+        trade_win_rate = float(win_rate * 100.0)
+        scan_cov = 0.0
+        scan_pass = 0.0
+        scan_err = 0.0
+        scan_rows = []
+        for e in self.events[-2000:]:
+            if e.get("stage") == "SCAN_EFFICIENCY":
+                p = e.get("payload") or {}
+                scan_cov = float(p.get("coverage_pct", scan_cov) or 0.0)
+                scan_pass = float(p.get("pass_rate_pct", scan_pass) or 0.0)
+                scan_err = float(p.get("error_rate_pct", scan_err) or 0.0)
+                scan_rows.append([
+                    fmt_ts(e.get("ts")),
+                    f"{float(p.get('coverage_pct',0.0)):.1f}",
+                    f"{float(p.get('pass_rate_pct',0.0)):.1f}",
+                    f"{float(p.get('error_rate_pct',0.0)):.1f}",
+                    int(p.get("processed",0) or 0),
+                    int(p.get("errors",0) or 0),
+                ])
+
+        self.kpi_sig_total.setText(f"Сигналы: {signal_total}")
+        self.kpi_sig_pass.setText(f"PASS: {signal_pass} ({signal_pass_rate:.1f}%)")
+        self.kpi_opened.setText(f"Открыто: {trade_open_total}")
+        self.kpi_closed.setText(f"Закрыто: {trade_closed_total}")
+        self.kpi_winrate.setText(f"WinRate: {trade_win_rate:.1f}%")
+        self.pb_signal_pass.setValue(int(max(0,min(100, round(signal_pass_rate)))))
+        self.pb_trade_win.setValue(int(max(0,min(100, round(trade_win_rate)))))
+        self.pb_scan_cov.setValue(int(max(0,min(100, round(scan_cov)))))
+
+        self.tbl_stats_models.set_rows([
+            ["Model-A samples", int(mh.get("samples", 0) or 0)],
+            ["Model-A AUC", f"{float(mh.get('auc',0.0) or 0.0):.3f}"],
+            ["Model-A accuracy", f"{float(mh.get('accuracy',0.0) or 0.0):.3f}"],
+            ["Model-B dataset rows", int((modelb_status or {}).get("dataset_rows",0) or 0)],
+            ["Model-B pos rate", f"{float((modelb_status or {}).get('dataset_pos_rate',0.0) or 0.0):.2%}"],
+            ["Model-B progress", f"{float((modelb_status or {}).get('training_progress',0.0) or 0.0):.0%}"],
+            ["Model-B retrain reason", str((modelb_status or {}).get("last_retrain_reason", "n/a"))],
+        ])
+        self.tbl_stats_trades.set_rows([
+            ["Signals total", signal_total],
+            ["Signals PASS", signal_pass],
+            ["Signals FAIL", signal_fail],
+            ["Trades open", trade_open_total],
+            ["Trades closed", trade_closed_total],
+            ["Closed by TP", close_tp],
+            ["Closed by SL", close_sl],
+            ["Win rate", f"{trade_win_rate:.1f}%"],
+            ["Scanner pass rate", f"{scan_pass:.1f}%"],
+            ["Scanner error rate", f"{scan_err:.1f}%"],
+        ])
+        self.tbl_stats_scan.set_rows(scan_rows[-120:])
 
         # last command feedback (telegram test / reload config)
         for e in reversed(self.events[-500:]):
