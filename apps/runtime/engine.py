@@ -427,12 +427,20 @@ class Engine:
                 ensemble_cfg = dict(((self.cfg.get("model", {}) or {}).get("ensemble", {}) or {}))
                 min_samples_for_a = int(self.cfg.get("model", {}).get("min_samples", 300) or 300)
                 reliability = min(1.0, max(0.1, float(mhealth.get("samples", 0)) / max(1.0, float(min_samples_for_a))))
-                if mout.get("bootstrap_mode") == "forecast":
-                    reliability = min(reliability, 0.35)
                 base_wa = float(ensemble_cfg.get("w_a", 0.55))
                 base_wb = float(ensemble_cfg.get("w_b", 0.45))
-                dyn_wa = max(0.10, min(0.80, base_wa * reliability))
-                dyn_wb = max(0.10, min(0.90, base_wb + (base_wa - dyn_wa)))
+                if mout.get("bootstrap_mode") == "forecast":
+                    # Cold-start guard: bootstrap forecast carries directional information,
+                    # so avoid collapsing Model-A contribution to near-zero.
+                    reliability = max(reliability, 0.65)
+                    gz = ensemble_cfg.get("gray_zone", [0.45, 0.55])
+                    if isinstance(gz, (list, tuple)) and len(gz) == 2:
+                        lo = float(gz[0]); hi = float(gz[1])
+                        mid = 0.5 * (lo + hi)
+                        half = max(0.01, min(0.06, 0.5 * (hi - lo) * 0.6))
+                        ensemble_cfg["gray_zone"] = [mid - half, mid + half]
+                dyn_wa = max(0.25, min(0.80, base_wa * reliability))
+                dyn_wb = max(0.20, min(0.75, base_wb + (base_wa - dyn_wa)))
                 norm = max(1e-9, dyn_wa + dyn_wb)
                 ensemble_cfg["w_a"] = dyn_wa / norm
                 ensemble_cfg["w_b"] = dyn_wb / norm

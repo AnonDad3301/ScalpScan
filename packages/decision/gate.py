@@ -105,10 +105,10 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
 
     model_a_direction = str(model_out.get("model_a_direction", ""))
     model_b_direction = str(model_out.get("model_b_direction", ""))
-    if (not enforce_directional_agreement) or (model_b_direction in ("", "NEUTRAL")):
+    if (not enforce_directional_agreement) or (model_a_direction in ("", "NEUTRAL")) or (model_b_direction in ("", "NEUTRAL")):
         agree = True
     else:
-        agree = bool(model_a_direction) and (model_a_direction == model_b_direction)
+        agree = (model_a_direction == model_b_direction)
     add("DIRECTIONAL_AGREEMENT", agree, f"{model_a_direction}/{model_b_direction}", "same")
 
     costs = float(features.get("costs_bps", 0.0)) / 10000.0
