@@ -3,6 +3,8 @@ runtime:
   exchange: bybit
   market: perp
   testnet: false
+  bybit_channel: linear
+  bitget_inst_type: USDT-FUTURES
   ws_stale_resub_ms: 3000
   ws_stale_reconnect_ms: 10000
   timeframe: 1m
@@ -121,6 +123,9 @@ modernization:
   forecast_mc_samples: 64
   regime_volatility_threshold: 0.004
   regime_trend_threshold: 0.25
+  similarity_top_k: 5
+  similarity_method: cosine
+  similarity_history_limit: 3000
 
 notifications:
   telegram:

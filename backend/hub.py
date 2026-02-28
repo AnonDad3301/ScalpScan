@@ -22,7 +22,7 @@ from packages.infra.symbol_store.sqlite_symbols import SymbolStore
 from packages.infra.market.mock import MockMarket
 from packages.infra.market.ccxt_market import CCXTMarket
 from apps.runtime.engine import Engine
-from backend.bybit_ws_prices import BybitPublicWS
+from backend.market_data_adapter import build_public_ws_client
 from backend.price_worker import PriceWorker
 from backend.monitoring_api import start_monitoring_api
 from packages.obs.telemetry import Telemetry
@@ -730,7 +730,7 @@ async def main():
     eng = Engine(cfg, market, es, ss, symdb)
     eng.telemetry = tele
 
-    ws_client = BybitPublicWS(channel='linear', testnet=bool(cfg.get('runtime',{}).get('testnet', False)))
+    ws_client = build_public_ws_client(cfg.get('runtime', {}))
     ws_stop = asyncio.Event()
     ws_task = asyncio.create_task(ws_client.run(ws_stop))
 

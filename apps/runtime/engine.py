@@ -20,7 +20,13 @@ from packages.model.model_b_trainer import Trainer
 from packages.decision.gate import decide as gate_decide
 from packages.execution.paper import PaperPortfolio
 from packages.obs.telemetry import Telemetry
-from packages.modernization import MarketPatternScanner, MultiHorizonForecaster, MarketRegimeDetector
+from packages.modernization import (
+    MarketPatternScanner,
+    MultiHorizonForecaster,
+    MarketRegimeDetector,
+    PatternSimilarityEngine,
+    ScenarioSimulationEngine,
+)
 
 
 def now_ms() -> int:
@@ -90,6 +96,10 @@ class Engine:
             vol_threshold=float(mod_cfg.get('regime_volatility_threshold', 0.004)),
             trend_threshold=float(mod_cfg.get('regime_trend_threshold', 0.25)),
         )
+        self.similarity_engine = PatternSimilarityEngine(top_k=int(mod_cfg.get('similarity_top_k', 5)))
+        self.sim_engine = ScenarioSimulationEngine()
+        self._historical_vectors: Dict[str, List[np.ndarray]] = {}
+        self._historical_outcomes: Dict[str, List[Dict[str, float]]] = {}
         self._open_feature_bank: Dict[str, np.ndarray] = {}
         self._open_trade_meta: Dict[str, Dict[str, Any]] = {}
         self._sl_streak: int = 0
@@ -401,6 +411,46 @@ class Engine:
                     "unc_5m": float(f5.get("uncertainty",1.0) or 1.0),
                     "breakout_strength": float(getattr(pattern, "breakout_strength", 0.0)),
                 }))
+
+                vec = np.array([
+                    float(feats.get("ret_last", 0.0)),
+                    float(feats.get("vwap_dist", 0.0)),
+                    float(feats.get("microprice_delta_bps", 0.0)),
+                    float(feats.get("realized_vol", 0.0)),
+                    float(ob.get("imbalance", 0.0) or 0.0),
+                    float(ob.get("spread_bps", 0.0) or 0.0),
+                    float(getattr(pattern, "breakout_strength", 0.0)),
+                ], dtype=float)
+                hist_vec = self._historical_vectors.setdefault(sym, [])
+                hist_out = self._historical_outcomes.setdefault(sym, [])
+                cases = self.similarity_engine.find_topk(vec, hist_vec, hist_out, method=str(self.cfg.get("modernization", {}).get("similarity_method", "cosine")))
+                sim_summary = self.similarity_engine.summarize(cases)
+                forecast_4m = forecast.get("m4", forecast.get("m5", {})) if isinstance(forecast, dict) else {}
+                sim_payload = self.sim_engine.simulate(sim_summary, forecast_4m if isinstance(forecast_4m, dict) else {})
+                self.es.append(mk_event(env, "PATTERN_SIMILARITY", "INFO", {
+                    "top_k": [c.__dict__ for c in cases],
+                    "summary": sim_summary,
+                }))
+                self.es.append(mk_event(env, "SIMULATION_SCENARIOS", "INFO", sim_payload))
+                self.es.append(mk_event(env, "FORECAST_4M", "INFO", {
+                    "p_up": float(sim_summary.get("p_up_4m", 0.0)),
+                    "p_down": float(sim_summary.get("p_down_4m", 0.0)),
+                    "p_flat": float(sim_summary.get("p_flat_4m", 1.0)),
+                    "expected_range": sim_payload.get("expected_range", {}),
+                    "confidence": float(sim_payload.get("confidence", 0.0)),
+                    "drivers": ["candles", "orderbook", "historical_similarity", "volatility"],
+                }))
+
+                if len(arr) > 4:
+                    ret_1m = float((arr[-1] - arr[-2]) / max(1e-12, arr[-2]))
+                    ret_2m = float((arr[-1] - arr[-3]) / max(1e-12, arr[-3])) if len(arr) > 3 else ret_1m
+                    ret_4m = float((arr[-1] - arr[-5]) / max(1e-12, arr[-5])) if len(arr) > 5 else ret_2m
+                    hist_vec.append(vec)
+                    hist_out.append({"ret_1m": ret_1m, "ret_2m": ret_2m, "ret_4m": ret_4m})
+                    max_hist = int(self.cfg.get("modernization", {}).get("similarity_history_limit", 3000))
+                    if len(hist_vec) > max_hist:
+                        self._historical_vectors[sym] = hist_vec[-max_hist:]
+                        self._historical_outcomes[sym] = hist_out[-max_hist:]
 
                 # enrich features for gate + model-b observability
                 f1 = forecast.get("m1", {}) if isinstance(forecast, dict) else {}
