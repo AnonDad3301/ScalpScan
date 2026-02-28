@@ -38,6 +38,13 @@ class EngineTrainingInputsTests(unittest.TestCase):
         self.assertGreaterEqual(float(ctx["conf_60m"]), 0.0)
         self.assertEqual(ctx["dir_60m"], "LONG")
 
+    def test_debias_prob_pulls_long_drift_toward_center(self):
+        eng = Engine.__new__(Engine)
+        eng._p_center_ema = 0.70
+        out = eng._debias_prob(0.80)
+        self.assertLess(out, 0.80)
+        self.assertGreaterEqual(out, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

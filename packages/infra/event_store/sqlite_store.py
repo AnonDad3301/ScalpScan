@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -12,6 +13,7 @@ class SQLiteEventStore:
     def __init__(self, path: str):
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        self.unified_log_path = str(Path(self.path).with_name("unified_events.log.jsonl"))
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA synchronous=NORMAL;")
@@ -63,6 +65,48 @@ class SQLiteEventStore:
                 (ts, run_id, service, exchange, market, symbol, timeframe, stage, level, event_id, payload_json, schema_version, source, tags_json),
             )
             self.conn.commit()
+        self._append_unified_log({
+            "ts": ts,
+            "event_id": event_id,
+            "run_id": run_id,
+            "service": service,
+            "exchange": exchange,
+            "market": market,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "stage": stage,
+            "level": level,
+            "schema_version": schema_version,
+            "source": source,
+            "tags": event.get("tags", {}) or {},
+            "payload": event.get("payload", {}) or {},
+        })
+
+    def _append_unified_log(self, event: Dict[str, Any]) -> None:
+        try:
+            p = Path(self.unified_log_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with p.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+        except Exception:
+            # Must never break main event flow because of file logging failures.
+            pass
+
+    def unified_log_tail(self, limit: int = 200) -> List[Dict[str, Any]]:
+        p = Path(self.unified_log_path)
+        if not p.exists():
+            return []
+        out: List[Dict[str, Any]] = []
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    out.append(json.loads(ln))
+            return out[-int(max(1, limit)):]
+        except Exception:
+            return [{"ts": int(time.time() * 1000), "stage": "UNIFIED_LOG_READ_ERROR", "level": "ERROR"}]
 
     def tail(self, limit: int = 200) -> List[Dict[str, Any]]:
         with self._lock:

@@ -31,6 +31,16 @@ class EventSchemaAndTimelineTests(unittest.TestCase):
             self.assertAlmostEqual(float(row["value"]), 67.5, places=6)
             self.assertEqual(row["tags"].get("tf"), "3m")
 
+    def test_unified_log_file_is_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = f"{tmp}/events.sqlite"
+            es = SQLiteEventStore(db)
+            es.append({"ts": 2, "run_id": "r", "service": "s", "stage": "Y", "level": "INFO", "event_id": "e2", "payload": {"x": 2}})
+            rows = es.unified_log_tail(5)
+            self.assertTrue(len(rows) >= 1)
+            self.assertEqual(rows[-1].get("event_id"), "e2")
+            self.assertEqual(rows[-1].get("stage"), "Y")
+
 
 if __name__ == "__main__":
     unittest.main()

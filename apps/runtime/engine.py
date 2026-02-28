@@ -94,6 +94,16 @@ class Engine:
         self._open_trade_meta: Dict[str, Dict[str, Any]] = {}
         self._sl_streak: int = 0
         self._symbol_cursor: int = 0
+        self._p_center_ema: float = 0.5
+
+    def _debias_prob(self, p: float) -> float:
+        p = float(max(0.0, min(1.0, p)))
+        drift = float(self._p_center_ema - 0.5)
+        # If recent flow is one-sided (e.g. mostly LONG), pull probability toward center.
+        debiased = p - 0.70 * drift
+        out = float(max(0.0, min(1.0, debiased)))
+        self._p_center_ema = 0.98 * self._p_center_ema + 0.02 * p
+        return out
 
 
     def _symbols_for_tick(self, symbols: List[str]) -> List[str]:
@@ -578,6 +588,7 @@ class Engine:
                 mtf_conf = max(float(feats.get("trend_conf_15m", 0.0)), float(feats.get("trend_conf_60m", 0.0)))
                 mtf_weight = min(0.12, 0.03 + 0.09 * max(0.0, min(1.0, mtf_conf)))
                 p_adj = max(0.0, min(1.0, p_raw + mtf_weight * mtf_bias))
+                p_adj = self._debias_prob(p_adj)
                 ens_d["p_up_3m"] = p_adj
                 ens_d["p_up_5m"] = max(0.0, min(1.0, float(ens_d.get("p_up_5m", 0.5)) + 0.75 * mtf_weight * mtf_bias))
                 ens_d["signal_strength"] = abs(p_adj - 0.5) * 2.0
