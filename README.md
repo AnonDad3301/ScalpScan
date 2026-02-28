@@ -1,4 +1,4 @@
-# ScalpForge Desktop (PySide6/Qt) — v1.3.8 (No Docker)
+# ScalpForge Desktop (PySide6/Qt) — v1.7.0 (No Docker)
 
 Цель: UI как терминал — плавные таблицы, live PnL, минимальная задержка.
 Архитектура: backend hub (WebSocket) + runtime tick loop + optional price polling (ccxt).
@@ -22,6 +22,7 @@ python desktop_app/main.py
 
 ## Конфиг
 `config.yaml` — adapter mock/ccxt, exchange, market, timeframe, N пар, интервалы.
+- `runtime.ws_port` по умолчанию: `8766` (hub/UI/preflight).
 
 
 ## Предпроверка
@@ -125,3 +126,5 @@ v1.3.8: POSITIONS_SNAPSHOT persisted; WS ping disabled; websockets logs silenced
 - Новые параметры в `config.yaml`:
   - `runtime.monitoring_host`, `runtime.monitoring_port`,
   - секция `modernization` для тюнинга сканера/форкастера/детектора режима.
+
+- PRICE_TICK получает статус `DEGRADED`, если WS подключен, но канал устарел/не даёт тикеров; UI показывает этот режим отдельно.

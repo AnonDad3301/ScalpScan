@@ -18,6 +18,10 @@ class WSState:
     ticker_updates: int = 0
     ticker_updates_1s: int = 0
     last_tick_1s_ms: int = 0
+    desired_n: int = 0
+    subscribed_n: int = 0
+    last_sub_req: Dict[str, object] = field(default_factory=dict)
+    last_error: str = ""
 
 def _to_bybit_symbol(sym: str) -> str:
     s = sym.split(":")[0]
@@ -33,6 +37,7 @@ class BybitPublicWS:
         self._bybit_to_orig: Dict[str, str] = {}
         self._lock = asyncio.Lock()
         self._subscribed: Set[str] = set()
+        self._pending_sub_reqs: Dict[str, List[str]] = {}
         self._force_resub = False
         self._force_reconnect = False
 
@@ -57,6 +62,7 @@ class BybitPublicWS:
                     self.state.ticker_updates_1s = 0
                     self.state.last_tick_1s_ms = now
                     self._subscribed = set()
+                    self._pending_sub_reqs = {}
 
                     async def pinger():
                         while not stop_evt.is_set():
@@ -101,41 +107,56 @@ class BybitPublicWS:
                             self.state.last_pong_ms = int(time.time()*1000)
                             continue
 
-                        # subscribe ack
-                        if msg.get("op") == "subscribe" or ("success" in msg and "ret_msg" in msg):
-                            self.state.last_sub_ack = msg
-                            if msg.get("success") is True or msg.get("retCode") in (0, "0"):
-                                self.state.sub_ok += 1
-                            else:
-                                self.state.sub_err += 1
-                            continue
-
-                        topic = msg.get("topic","")
-                        if isinstance(topic, str) and topic.startswith("tickers."):
-                            data = msg.get("data", {})
-                            if isinstance(data, dict):
-                                b_sym = data.get("symbol") or topic.split(".",1)[1]
-                                last = data.get("lastPrice")
-                                if b_sym and last is not None:
-                                    try:
-                                        px = float(last)
-                                    except Exception:
-                                        px = None
-                                    if px is not None:
-                                        async with self._lock:
-                                            orig = self._bybit_to_orig.get(str(b_sym), str(b_sym))
-                                            self._prices[orig] = px
-                                        self.state.ticker_updates += 1
-                                        self.state.ticker_updates_1s += 1
+                        if await self._handle_message(msg):
                             continue
 
                         if (int(time.time()*1000) - self.state.last_sub_ms) > 5000:
                             await self._sync_subs(ws)
 
                     ping_task.cancel()
-            except Exception:
+            except Exception as e:
                 self.state.connected = False
+                self.state.last_error = f"{type(e).__name__}: {e}"
                 await asyncio.sleep(1.0)
+
+    async def _handle_message(self, msg: Dict[str, object]) -> bool:
+        # subscribe ack
+        if msg.get("op") == "subscribe" or ("success" in msg and "ret_msg" in msg):
+            self.state.last_sub_ack = msg
+            req_id = str(msg.get("req_id") or "")
+            chunk = self._pending_sub_reqs.pop(req_id, []) if req_id else []
+            if msg.get("success") is True or msg.get("retCode") in (0, "0"):
+                self.state.sub_ok += 1
+                for a in chunk:
+                    self._subscribed.add(a)
+            else:
+                self.state.sub_err += 1
+            self.state.subscribed_n = len(self._subscribed)
+            return True
+
+        topic = msg.get("topic", "")
+        if isinstance(topic, str) and topic.startswith("tickers."):
+            data = msg.get("data", {})
+            rows = data if isinstance(data, list) else [data]
+            if not isinstance(rows, list):
+                return True
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                b_sym = row.get("symbol") or topic.split(".", 1)[1]
+                last = row.get("lastPrice")
+                if b_sym and last is not None:
+                    try:
+                        px = float(last)
+                    except Exception:
+                        continue
+                    async with self._lock:
+                        orig = self._bybit_to_orig.get(str(b_sym), str(b_sym))
+                        self._prices[orig] = px
+                    self.state.ticker_updates += 1
+                    self.state.ticker_updates_1s += 1
+            return True
+        return False
 
     async def _sync_subs(self, ws) -> None:
         async with self._lock:
@@ -149,20 +170,23 @@ class BybitPublicWS:
                 bybit_to_orig[b] = s
         async with self._lock:
             self._bybit_to_orig = bybit_to_orig
+            self.state.desired_n = len(bybit_syms)
 
         args = [f"tickers.{b}" for b in bybit_syms]
         if not args:
             return
-        new_args = [a for a in args if a not in self._subscribed]
+        pending_args = {a for chunk in self._pending_sub_reqs.values() for a in chunk}
+        new_args = [a for a in args if a not in self._subscribed and a not in pending_args]
         if not new_args:
             return
         for i in range(0, len(new_args), 50):
             chunk = new_args[i:i+50]
+            req_id = f"sub-{int(time.time()*1000)}-{i}"
             try:
-                await ws.send(json.dumps({"op":"subscribe","args":chunk}))
+                await ws.send(json.dumps({"op":"subscribe","args":chunk, "req_id": req_id}))
                 self.state.last_sub_ms = int(time.time()*1000)
-                for a in chunk:
-                    self._subscribed.add(a)
+                self.state.last_sub_req = {"req_id": req_id, "args": chunk}
+                self._pending_sub_reqs[req_id] = chunk
             except Exception:
                 return
 
