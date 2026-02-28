@@ -2,11 +2,12 @@ from __future__ import annotations
 import time
 from packages.obs.messages import explain
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import numpy as np
 
 from packages.feature.pipeline import compute as compute_features
 from packages.feature.invariants import check as inv_check, ok as inv_ok
+from packages.feature.indicators import rsi as ta_rsi, atr as ta_atr, adx_wilder as ta_adx
 from packages.model.trainer import OnlineTrainer
 from packages.model.ensemble import meta_decide
 from packages.model.labeling import triple_barrier_labels
@@ -38,6 +39,9 @@ def mk_event(base: Dict[str, Any], stage: str, level: str, payload: Dict[str, An
         "stage": stage,
         "level": level,
         "payload": payload,
+        "schema_version": 2,
+        "source": "runtime",
+        "tags": {"stage": stage},
     }
 
 def label_forward(close: np.ndarray, forward: int) -> np.ndarray:
@@ -60,10 +64,12 @@ class Engine:
         self.model_b = ModelBPatchTST(hf_id=str(cfg.get('model_b',{}).get('hf_id','ibm-research/patchtst-fm-r1')), cache_dir=str(cfg.get('model_b',{}).get('cache_dir','data/hf_cache')), device=str(cfg.get('model_b',{}).get('device','cpu')))
         self.model_b_state = self.model_b.load()
         self.registry = Registry(root=str(cfg.get('storage',{}).get('model_registry','data/model_registry')))
+        est_costs_bps = float(cfg.get("execution", {}).get("fees_bps", 0.0) or 0.0) + float(cfg.get("execution", {}).get("slippage_bps", 0.0) or 0.0)
         self.ds_builder = DatasetBuilder(path=str(cfg.get('storage',{}).get('model_b_dataset','data/datasets/model_b_samples.csv')),
                                         horizon_bars=int(cfg.get('model_b',{}).get('horizon_bars',12)),
                                         breakout_atr=float(cfg.get('model_b',{}).get('breakout_atr',0.25)),
-                                        hold_bars=int(cfg.get('model_b',{}).get('hold_bars',2)))
+                                        hold_bars=int(cfg.get('model_b',{}).get('hold_bars',2)),
+                                        label_ret_threshold=float(cfg.get('model_b', {}).get('label_ret_threshold', max(1e-5, (est_costs_bps / 10000.0) * 0.75))))
         self.model_b_trainer = Trainer(dataset_path=self.ds_builder.path, registry=self.registry,
                                             retrain_interval_sec=float(cfg.get('model_b',{}).get('retrain_interval_sec',1800.0)))
         self.es.append(mk_event(base_init, 'MODEL_B_LOAD_END', 'INFO' if self.model_b_state.loaded else 'ERROR', {'state': self.model_b_state.__dict__}))
@@ -85,7 +91,146 @@ class Engine:
             trend_threshold=float(mod_cfg.get('regime_trend_threshold', 0.25)),
         )
         self._open_feature_bank: Dict[str, np.ndarray] = {}
+        self._open_trade_meta: Dict[str, Dict[str, Any]] = {}
         self._sl_streak: int = 0
+        self._symbol_cursor: int = 0
+        self._p_center_ema: float = 0.5
+
+    def _debias_prob(self, p: float) -> float:
+        p = float(max(0.0, min(1.0, p)))
+        drift = float(self._p_center_ema - 0.5)
+        # If recent flow is one-sided (e.g. mostly LONG), pull probability toward center.
+        debiased = p - 0.70 * drift
+        out = float(max(0.0, min(1.0, debiased)))
+        self._p_center_ema = 0.98 * self._p_center_ema + 0.02 * p
+        return out
+
+
+    def _symbols_for_tick(self, symbols: List[str]) -> List[str]:
+        rt = self.cfg.get("runtime", {}) or {}
+        per_tick = int(rt.get("tick_symbols_per_cycle", 8) or 0)
+        if per_tick <= 0 or per_tick >= len(symbols):
+            return symbols
+        start = int(self._symbol_cursor % len(symbols))
+        out = [symbols[(start + i) % len(symbols)] for i in range(per_tick)]
+        self._symbol_cursor = (start + per_tick) % len(symbols)
+        return out
+
+
+
+    def _build_model_a_matrix(self, ohlcv: List[tuple], ob: Dict[str, Any]) -> np.ndarray:
+        if not ohlcv:
+            return np.zeros((0, 5), dtype=float)
+        arr = np.asarray([[o, h, l, c, v] for _, o, h, l, c, v in ohlcv], dtype=float)
+        high = arr[:, 1]
+        low = arr[:, 2]
+        close = arr[:, 3]
+
+        spread = float(ob.get("spread", 0.0) or 0.0)
+        ob_imb = float(ob.get("imbalance", 0.0) or 0.0)
+
+        rows = []
+        for i in range(len(close)):
+            h = high[: i + 1]
+            l = low[: i + 1]
+            c = close[: i + 1]
+            rows.append([
+                ta_rsi(c, 14),
+                ta_atr(h, l, c, 14),
+                ta_adx(h, l, c, 14),
+                ob_imb,
+                spread,
+            ])
+        return np.asarray(rows, dtype=float)
+
+
+
+    def _timeframe_minutes(self, tf: Optional[str]) -> int:
+        t = str(tf or "").strip().lower()
+        if t.endswith("m"):
+            return max(1, int(float(t[:-1] or 1)))
+        if t.endswith("h"):
+            return max(1, int(float(t[:-1] or 1) * 60))
+        return 1
+
+    def _mtf_trend_context(self, close: np.ndarray, timeframe: str) -> Dict[str, Any]:
+        if close.size < 8:
+            return {
+                "dir_15m": "NEUTRAL",
+                "dir_60m": "NEUTRAL",
+                "score_15m": 0.0,
+                "score_60m": 0.0,
+                "conf_15m": 0.0,
+                "conf_60m": 0.0,
+                "bias": 0.0,
+            }
+        tf_min = self._timeframe_minutes(timeframe)
+
+        def _ema(series: np.ndarray, span: int) -> np.ndarray:
+            span = max(2, int(span))
+            alpha = 2.0 / (span + 1.0)
+            out = np.zeros_like(series, dtype=float)
+            out[0] = float(series[0])
+            for i in range(1, len(series)):
+                out[i] = alpha * float(series[i]) + (1.0 - alpha) * out[i - 1]
+            return out
+
+        def _score(window_min: int) -> float:
+            bars = max(3, int(round(window_min / max(1, tf_min))))
+            bars = min(int(close.size - 1), bars)
+            if bars < 3:
+                return 0.0
+            seg = close[-(bars+1):]
+            if seg.size < 4:
+                return 0.0
+            ret = float((seg[-1] - seg[0]) / max(1e-12, seg[0]))
+            noise = float(np.std(np.diff(seg) / np.maximum(1e-12, seg[:-1])))
+            ret_z = ret / max(1e-6, noise)
+
+            fast = max(3, bars // 4)
+            slow = max(fast + 1, bars // 2)
+            ema_fast = _ema(seg, fast)
+            ema_slow = _ema(seg, slow)
+            ema_bias = float((ema_fast[-1] - ema_slow[-1]) / max(1e-12, seg[-1]))
+
+            x = np.arange(seg.size, dtype=float)
+            try:
+                slope = float(np.polyfit(x, seg, 1)[0]) / max(1e-12, float(np.mean(seg)))
+            except Exception:
+                slope = 0.0
+
+            score = (
+                0.45 * np.tanh(0.40 * ret_z)
+                + 0.35 * np.tanh(120.0 * ema_bias)
+                + 0.20 * np.tanh(400.0 * slope)
+            )
+            return float(max(-1.0, min(1.0, score)))
+
+        s15 = _score(15)
+        s60 = _score(60)
+
+        def _dir(v: float) -> str:
+            if v > 0.12:
+                return "LONG"
+            if v < -0.12:
+                return "SHORT"
+            return "NEUTRAL"
+
+        d15 = _dir(s15)
+        d60 = _dir(s60)
+        c15 = abs(float(s15))
+        c60 = abs(float(s60))
+        align = 1.0 if np.sign(s15) == np.sign(s60) else 0.65
+        bias = align * (0.35 * np.tanh(1.0 * s15) + 0.65 * np.tanh(0.85 * s60))
+        return {
+            "dir_15m": d15,
+            "dir_60m": d60,
+            "score_15m": float(s15),
+            "score_60m": float(s60),
+            "conf_15m": float(c15),
+            "conf_60m": float(c60),
+            "bias": float(max(-1.0, min(1.0, bias))),
+        }
 
 
     def sync_symbols(self) -> int:
@@ -95,10 +240,38 @@ class Engine:
     def universe(self) -> List[str]:
         u=self.cfg["universe"]; rt=self.cfg["runtime"]
         limit=int(rt.get("max_pairs",50))
+        custom = list(u.get("custom_symbols", []) or [])
+
+        def _dedup_fill(primary: List[str], fallback: List[str], cap: int) -> List[str]:
+            out: List[str] = []
+            seen = set()
+            for s in (primary or []):
+                if s in seen:
+                    continue
+                seen.add(s)
+                out.append(s)
+                if len(out) >= cap:
+                    return out
+            for s in (fallback or []):
+                if s in seen:
+                    continue
+                seen.add(s)
+                out.append(s)
+                if len(out) >= cap:
+                    return out
+            return out
+
         if u.get("mode","db")=="db":
-            top=self.symdb.top_symbols(rt["exchange"], rt["market"], limit, quote=u.get("quote"), min_volume=float(u.get("min_volume",0)))
-            return top if top else u.get("custom_symbols",[])[:limit]
-        return u.get("custom_symbols",[])[:limit]
+            quote = u.get("quote")
+            min_volume = float(u.get("min_volume",0))
+            top=self.symdb.top_symbols(rt["exchange"], rt["market"], limit, quote=quote, min_volume=min_volume)
+            # Production safeguard: if DB liquidity filter becomes too strict and returns
+            # very few rows, broaden with quote-only rows and static fallback symbols.
+            if len(top) < limit:
+                top_relaxed = self.symdb.top_symbols(rt["exchange"], rt["market"], limit * 3, quote=quote, min_volume=0.0)
+                top = _dedup_fill(top, top_relaxed, limit)
+            return _dedup_fill(top, custom, limit)
+        return custom[:limit]
 
     def tick(self) -> str:
         price_source=str(self.cfg.get('pricing',{}).get('price_source','last'))
@@ -112,12 +285,29 @@ class Engine:
         run_id=str(uuid.uuid4())
         base={"run_id":run_id,"service":"sf-runtime","exchange":rt["exchange"],"market":rt["market"],"timeframe":rt["timeframe"],"symbol":"*"}
         symbols=self.universe()
-        self.es.append(mk_event(base,"UNIVERSE_SELECTED","INFO",{"selected_n":len(symbols),"selected":symbols[:1000]}))
+        tick_symbols = self._symbols_for_tick(symbols) if symbols else []
+        self.es.append(mk_event(base,"UNIVERSE_SELECTED","INFO",{
+            "selected_n": len(symbols),
+            "tick_n": len(tick_symbols),
+            "cursor": int(self._symbol_cursor),
+            "selected": tick_symbols[:1000],
+        }))
 
         prices: Dict[str, float] = {}
         market_ctx: Dict[str, Dict[str, Any]] = {}
+        scan_stats = {
+            "symbols_total": len(symbols),
+            "symbols_tick": len(tick_symbols),
+            "attempted": len(tick_symbols),
+            "processed": 0,
+            "inv_fail": 0,
+            "gate_pass": 0,
+            "errors": 0,
+            "samples_added": 0,
+        }
 
-        for sym in symbols:
+        for sym in tick_symbols:
+            scan_stats["processed"] += 1
             env=dict(base); env["symbol"]=sym
             try:
                 sp1=self.telemetry.span_start('FETCH_OHLCV', trace_id=run_id, symbol=sym)
@@ -139,6 +329,15 @@ class Engine:
                     "spread":ob.get("spread"),
                     "imb":ob.get("imbalance")
                 }))
+
+                min_rows = max(24, int(rt.get("lookback", 0) or 0) // 4, int(self.cfg.get("model", {}).get("forward", 4) or 4) + 6)
+                if len(ohlcv) < min_rows:
+                    self.es.append(mk_event(env, "DATA_INSUFFICIENT", "INFO", {
+                        "ohlcv_rows": len(ohlcv),
+                        "required_rows": min_rows,
+                        "reason": "SHORT_OHLCV",
+                    }))
+                    continue
 
                 feats=compute_features(ohlcv, ob)
                 try:
@@ -162,10 +361,12 @@ class Engine:
                 inv=inv_check(feats, self.cfg["features"]["invariants"])
                 self.es.append(mk_event(env,"FEATURES_COMPUTED","INFO",{"features":feats,"invariants":inv}))
                 if not inv_ok(inv):
+                    scan_stats["inv_fail"] += 1
                     self.es.append(mk_event(env,"GATE_DECISION","INFO",{"decision":"FAIL","reasons":["INVARIANTS_OK"]}))
                     continue
 
                 arr=np.array([c for _,_,_,_,c,_ in ohlcv], dtype=float)
+                mtf_ctx = self._mtf_trend_context(arr, rt.get("timeframe", "1m"))
                 pattern = self.pattern_scanner.scan(ohlcv)
                 regime = self.regime_detector.detect(arr)
                 regime_name_raw = str(getattr(regime, "name", "unknown"))
@@ -212,6 +413,13 @@ class Engine:
                 feats["rr_ratio"] = float(rr_ratio)
                 feats["trend_strength"] = float(trend_strength)
                 feats["regime"] = regime_name
+                feats["trend_dir_15m"] = mtf_ctx.get("dir_15m", "NEUTRAL")
+                feats["trend_dir_60m"] = mtf_ctx.get("dir_60m", "NEUTRAL")
+                feats["trend_score_15m"] = float(mtf_ctx.get("score_15m", 0.0))
+                feats["trend_score_60m"] = float(mtf_ctx.get("score_60m", 0.0))
+                feats["trend_conf_15m"] = float(mtf_ctx.get("conf_15m", 0.0))
+                feats["trend_conf_60m"] = float(mtf_ctx.get("conf_60m", 0.0))
+                feats["trend_mtf_bias"] = float(mtf_ctx.get("bias", 0.0))
                 st_live = self.portfolio.stats()
                 win_rate = float(st_live.get("win_rate", 0.5))
                 sl_rate = float(st_live.get("sl", 0)) / max(1.0, float(st_live.get("total_closed", 0)))
@@ -254,17 +462,40 @@ class Engine:
                     horizon_bars=max(3, min(5, fwd)),
                     tp_atr_mult=float(self.cfg.get("execution", {}).get("exits", {}).get("tp1_atr_mult", 1.1)),
                     sl_atr_mult=float(self.cfg.get("execution", {}).get("exits", {}).get("sl_atr_mult", 1.2)),
+                    costs_bps=float(self.cfg.get("execution", {}).get("fees_bps", 0.0) or 0.0) + float(self.cfg.get("execution", {}).get("slippage_bps", 0.0) or 0.0),
                 )
-                X=np.array([[feats["rsi"],feats["atr"],feats["adx"],feats["ob_imb"],feats["spread"]] for _ in range(len(arr))], dtype=float)
+                X=self._build_model_a_matrix(ohlcv, ob)
 
                 added=self.trainer.add_samples(X[:-fwd], y[:-fwd])
+                scan_stats["samples_added"] += int(added)
                 pass  # retrain throttled
+
+                if X.shape[0] == 0:
+                    self.es.append(mk_event(env, "DATA_INSUFFICIENT", "INFO", {
+                        "ohlcv_rows": len(ohlcv),
+                        "required_rows": 1,
+                        "reason": "EMPTY_MODEL_A_MATRIX",
+                    }))
+                    continue
 
                 x_last=X[-1]
                 mout=self.trainer.infer(x_last)
                 p_a_up3 = float(max(0.0, min(1.0, 0.5 + 0.5 * mout.get("pred", 0.0))))
                 p_a_up5 = float(max(0.0, min(1.0, 0.5 + 0.35 * mout.get("pred", 0.0))))
                 mhealth=self.trainer.health()
+                try:
+                    min_samples_boot = int(self.cfg.get("model", {}).get("min_samples", 50))
+                    bootstrap_on_cold = bool(self.cfg.get("model", {}).get("bootstrap_from_forecast", True))
+                    is_cold = int(mhealth.get("samples", 0)) < min_samples_boot
+                    is_flat = abs(float(mout.get("pred", 0.0))) < 1e-9
+                    if bootstrap_on_cold and is_cold and is_flat:
+                        p_a_up3 = float(max(0.0, min(1.0, p3)))
+                        p_a_up5 = float(max(0.0, min(1.0, p5)))
+                        mout["pred"] = float((p_a_up3 - 0.5) * 2.0)
+                        mout["confidence"] = float(max(p_a_up3, 1.0 - p_a_up3))
+                        mout["bootstrap_mode"] = "forecast"
+                except Exception:
+                    pass
                 self.es.append(mk_event(env,"MODEL_INFERRED","INFO",{
                     "pred":mout["pred"],"confidence":mout["confidence"],
                     "p_up_3m": p_a_up3, "p_up_5m": p_a_up5,
@@ -314,14 +545,36 @@ class Engine:
                         i=len(ohlcv)-(h+2)
                         c0=float(ohlcv[i][4]); c1=float(ohlcv[i+h][4])
                         ret=(c1-c0)/max(1e-12,c0)
-                        self.ds_builder.append_shadow(int(time.time()*1000), sym, int(ohlcv[-2][0]) if len(ohlcv)>1 else 0,
+                        written = self.ds_builder.append_shadow(int(time.time()*1000), sym, int(ohlcv[-2][0]) if len(ohlcv)>1 else 0,
                                                      int(time.time()*1000), price_source, "bybit.linear.swap", model_b_feats, ret)
-                        self.es.append(mk_event(env, "MODEL_B_DATASET_APPEND", "INFO", {"symbol": sym, "rows": self.ds_builder.stats().get("rows", 0), "ret": ret, "label": 1 if ret > 0 else 0}))
+                        if written:
+                            self.es.append(mk_event(env, "MODEL_B_DATASET_APPEND", "INFO", {"symbol": sym, "rows": self.ds_builder.stats().get("rows", 0), "ret": ret, "label": 1 if ret > 0 else 0}))
+                        else:
+                            self.es.append(mk_event(env, "MODEL_B_DATASET_SKIP", "INFO", {"symbol": sym, "ret": ret, "reason": "RET_THRESHOLD"}))
                 except Exception as e:
                     self.es.append(mk_event(env,"ERROR","ERROR",{"where":"MODEL_B_SHADOW","err":str(e)}))
 
                 model_b_prob = float(locals().get("prob", 0.5))
-                ensemble_cfg = ((self.cfg.get("model", {}) or {}).get("ensemble", {}) or {})
+                ensemble_cfg = dict(((self.cfg.get("model", {}) or {}).get("ensemble", {}) or {}))
+                min_samples_for_a = int(self.cfg.get("model", {}).get("min_samples", 300) or 300)
+                reliability = min(1.0, max(0.1, float(mhealth.get("samples", 0)) / max(1.0, float(min_samples_for_a))))
+                base_wa = float(ensemble_cfg.get("w_a", 0.55))
+                base_wb = float(ensemble_cfg.get("w_b", 0.45))
+                if mout.get("bootstrap_mode") == "forecast":
+                    # Cold-start guard: bootstrap forecast carries directional information,
+                    # so avoid collapsing Model-A contribution to near-zero.
+                    reliability = max(reliability, 0.65)
+                    gz = ensemble_cfg.get("gray_zone", [0.45, 0.55])
+                    if isinstance(gz, (list, tuple)) and len(gz) == 2:
+                        lo = float(gz[0]); hi = float(gz[1])
+                        mid = 0.5 * (lo + hi)
+                        half = max(0.01, min(0.06, 0.5 * (hi - lo) * 0.6))
+                        ensemble_cfg["gray_zone"] = [mid - half, mid + half]
+                dyn_wa = max(0.25, min(0.80, base_wa * reliability))
+                dyn_wb = max(0.20, min(0.75, base_wb + (base_wa - dyn_wa)))
+                norm = max(1e-9, dyn_wa + dyn_wb)
+                ensemble_cfg["w_a"] = dyn_wa / norm
+                ensemble_cfg["w_b"] = dyn_wb / norm
                 ens = meta_decide(
                     model_a={"p_up_3m": p_a_up3, "p_up_5m": p_a_up5},
                     model_b={"p_up_3m": model_b_prob, "p_up_5m": model_b_prob},
@@ -329,12 +582,33 @@ class Engine:
                     cfg=ensemble_cfg,
                 )
                 ens_d = ens.as_dict()
+                # Multi-timeframe trend alignment (15m/60m) correction
+                p_raw = float(ens_d.get("p_up_3m", 0.5))
+                mtf_bias = float(feats.get("trend_mtf_bias", 0.0))
+                mtf_conf = max(float(feats.get("trend_conf_15m", 0.0)), float(feats.get("trend_conf_60m", 0.0)))
+                mtf_weight = min(0.12, 0.03 + 0.09 * max(0.0, min(1.0, mtf_conf)))
+                p_adj = max(0.0, min(1.0, p_raw + mtf_weight * mtf_bias))
+                p_adj = self._debias_prob(p_adj)
+                ens_d["p_up_3m"] = p_adj
+                ens_d["p_up_5m"] = max(0.0, min(1.0, float(ens_d.get("p_up_5m", 0.5)) + 0.75 * mtf_weight * mtf_bias))
+                ens_d["signal_strength"] = abs(p_adj - 0.5) * 2.0
+                ens_d["confidence"] = max(p_adj, 1.0 - p_adj)
+                d60 = str(feats.get("trend_dir_60m", "NEUTRAL"))
+                dir_from_prob = "LONG" if p_adj >= 0.5 else "SHORT"
+                if d60 in ("LONG", "SHORT") and d60 != dir_from_prob and abs(float(feats.get("trend_score_60m", 0.0))) > 0.9:
+                    ens_d["no_trade_reason"] = ens_d.get("no_trade_reason") or "mtf_conflict"
+                ens_d["w_a"] = float(ensemble_cfg.get("w_a", 0.55))
+                ens_d["w_b"] = float(ensemble_cfg.get("w_b", 0.45))
+                ens_d["model_a_reliability"] = float(reliability)
                 self.es.append(mk_event(env, "ENSEMBLE_INFERRED", "INFO", ens_d))
                 mout["p_tp_first"] = ens_d.get("p_tp_first", 0.5)
                 mout["p_sl_first"] = ens_d.get("p_sl_first", 0.5)
                 mout["pred"] = (ens_d.get("p_up_3m", 0.5) - 0.5) * 2.0
                 mout["confidence"] = ens_d.get("confidence", mout.get("confidence", 0.5))
-                mout["model_a_direction"] = "LONG" if p_a_up3 >= 0.5 else "SHORT"
+                if reliability < 0.5:
+                    mout["model_a_direction"] = "NEUTRAL"
+                else:
+                    mout["model_a_direction"] = "LONG" if p_a_up3 >= 0.5 else "SHORT"
                 b_margin = float(self.cfg.get("model_b", {}).get("agreement_margin", 0.08) or 0.08)
                 if abs(model_b_prob - 0.5) < b_margin:
                     mout["model_b_direction"] = "NEUTRAL"
@@ -350,22 +624,49 @@ class Engine:
                      "auc_override_confidence_min": float(self.cfg["model"].get("auc_override_confidence_min",0.70))}
                 )
                 self.es.append(mk_event(env,"GATE_DECISION","INFO",gate))
+                if gate.get("decision") == "PASS":
+                    scan_stats["gate_pass"] += 1
+                else:
+                    self.es.append(mk_event(env, "LEARN_ON_REJECT", "INFO", {
+                        "enabled": True,
+                        "reasons": gate.get("reasons", [])[:5],
+                        "pred": float(mout.get("pred", 0.0)),
+                        "confidence": float(mout.get("confidence", 0.0)),
+                    }))
 
                 direction = str(ens_d.get("direction", "NEUTRAL"))
                 if ens_d.get("no_trade_reason"):
-                    gate["decision"] = "FAIL"
                     gate.setdefault("reasons", []).append(f"ENSEMBLE_{str(ens_d.get('no_trade_reason', 'no_trade')).upper()}")
 
-                self.es.append(mk_event(env,"SIGNAL","INFO",{
+                sl_mult = float(ex_cfg.get("sl_atr_mult", 1.2) or 1.2)
+                tp1_mult = float(ex_cfg.get("tp1_atr_mult", 1.1) or 1.1)
+                tp2_mult = float(ex_cfg.get("tp2_atr_mult", 1.7) or 1.7)
+                base = max(last_close * 0.0012, float(feats.get("atr", 0.0) or 0.0))
+                fallback_sl = (last_close - sl_mult * base) if direction == "LONG" else ((last_close + sl_mult * base) if direction == "SHORT" else None)
+                fallback_tp1 = (last_close + tp1_mult * base) if direction == "LONG" else ((last_close - tp1_mult * base) if direction == "SHORT" else None)
+                fallback_tp2 = (last_close + tp2_mult * base) if direction == "LONG" else ((last_close - tp2_mult * base) if direction == "SHORT" else None)
+                ctx = market_ctx.get(sym, {}) if isinstance(market_ctx, dict) else {}
+
+                signal_event = mk_event(env,"SIGNAL","INFO",{
                     "direction":direction,
                     "pred":mout["pred"],
                     "confidence":mout["confidence"],
                     "signal_strength": ens_d.get("signal_strength", 0.0),
                     "p_up_3m": ens_d.get("p_up_3m", 0.5),
                     "p_up_5m": ens_d.get("p_up_5m", 0.5),
+                    "p_down_3m": 1.0 - float(ens_d.get("p_up_3m", 0.5)),
+                    "p_down_5m": 1.0 - float(ens_d.get("p_up_5m", 0.5)),
                     "p_tp_first": ens_d.get("p_tp_first", 0.5),
                     "p_sl_first": ens_d.get("p_sl_first", 0.5),
+                    "p_breakout_up": p3,
+                    "p_breakout_down": 1.0 - float(p3),
                     "market_regime": feats.get("regime"),
+                    "trend_dir_15m": feats.get("trend_dir_15m"),
+                    "trend_dir_60m": feats.get("trend_dir_60m"),
+                    "trend_score_15m": feats.get("trend_score_15m"),
+                    "trend_score_60m": feats.get("trend_score_60m"),
+                    "volatility_pct": float(getattr(regime, "volatility", 0.0)) * 100.0,
+                    "atr_percentile": feats.get("atr_percentile", 0.0),
                     "decision_reasons": gate.get("reasons", [])[:3],
                     "ev": float(gate.get("expected_value", 0.0)),
                     "top_features": sorted([
@@ -376,17 +677,38 @@ class Engine:
                         ("trend_strength", abs(float(feats.get("trend_strength",0.0)))),
                     ], key=lambda x: x[1], reverse=True)[:3],
                     "gate":gate,
-                    "entry": last_close, "sl": feats.get("sl"), "tp1": feats.get("tp1"), "tp2": feats.get("tp2")
-                }))
+                    "entry": last_close,
+                    "sl": feats.get("sl") if feats.get("sl") is not None else fallback_sl,
+                    "tp1": feats.get("tp1") if feats.get("tp1") is not None else fallback_tp1,
+                    "tp2": feats.get("tp2") if feats.get("tp2") is not None else fallback_tp2,
+                    "support_level": ctx.get("bid_wall"),
+                    "resistance_level": ctx.get("ask_wall"),
+                })
+                self.es.append(signal_event)
 
                 if gate.get("decision")=="PASS" and direction in ("LONG","SHORT") and sym not in self.portfolio.positions:
                     res=self.portfolio.open(now_ms(), sym, direction, last_close, feats["atr"])
+                    trade_meta = {
+                        "signal_event_id": signal_event.get("event_id"),
+                        "signal_run_id": run_id,
+                        "signal_ts": signal_event.get("ts"),
+                        "symbol": sym,
+                        "side": direction,
+                    }
                     if res.get("result") == "OK":
                         self._open_feature_bank[sym] = np.asarray(x_last, dtype=float)
-                    self.es.append(mk_event(env,"TRADE_OPEN","INFO",res))
+                    trade_open_event = mk_event(env,"TRADE_OPEN","INFO",{**res, **trade_meta, "symbol": sym, "side": direction, "entry": last_close})
+                    self.es.append(trade_open_event)
+                    if res.get("result") == "OK":
+                        self._open_trade_meta[sym] = {**trade_meta, "open_trade_event_id": trade_open_event.get("event_id")}
 
             except Exception as e:
-                self.es.append(mk_event(env,"ERROR","ERROR",{"error":str(e)}))
+                scan_stats["errors"] += 1
+                self.es.append(mk_event(env,"ERROR","ERROR",{
+                    "where": "tick_symbol",
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                }))
         # retrain model at most once per interval (prevents stalls)
 
         # retrain Model B head on accumulated labeled samples (scheduled)
@@ -461,6 +783,10 @@ class Engine:
             for u in updates:
                 self.es.append(mk_event(base, "POSITION_UPDATE", "INFO", u))
             for c in closed:
+                sym = str(c.get("symbol", ""))
+                meta = self._open_trade_meta.pop(sym, {}) if sym else {}
+                if isinstance(meta, dict) and meta:
+                    c = {**c, **meta}
                 self.es.append(mk_event(base, "TRADE_CLOSED", "INFO", c))
                 try:
                     reason = str(c.get("reason", ""))
@@ -468,7 +794,6 @@ class Engine:
                         self._sl_streak += 1
                     elif reason in ("TP2", "TIME_STOP"):
                         self._sl_streak = 0
-                    sym = str(c.get("symbol", ""))
                     x = self._open_feature_bank.pop(sym, None)
                     pnl = float(c.get("pnl", 0.0) or 0.0)
                     y = 1 if pnl > 0 else (-1 if pnl < 0 else 0)
@@ -499,7 +824,20 @@ class Engine:
         self.es.append(mk_event(base, "POSITIONS_SNAPSHOT", "INFO", pos_payload))
 
         self.es.append(mk_event(base, "RUN_DONE", "INFO", {"run_id": run_id}))
+        self.es.append(mk_event(base, "SCAN_EFFICIENCY", "INFO", {
+            **scan_stats,
+            "coverage_pct": float(100.0 * scan_stats["symbols_tick"] / max(1, scan_stats["symbols_total"])),
+            "pass_rate_pct": float(100.0 * scan_stats["gate_pass"] / max(1, scan_stats["processed"])),
+            "error_rate_pct": float(100.0 * scan_stats["errors"] / max(1, scan_stats["processed"])),
+        }))
         # Model-B status heartbeat
+        try:
+            self.es.append(mk_event(base, "MODEL_A_STATUS", "INFO", {
+                **self.trainer.health(),
+                "since_last_added": int(getattr(self.trainer, "_since_last_added", 0)),
+            }))
+        except Exception:
+            pass
         try:
             st = self.ds_builder.stats() if hasattr(self,'ds_builder') else {}
             ds_stats = self.model_b_trainer.dataset_stats() if hasattr(self, 'model_b_trainer') else {}

@@ -74,13 +74,12 @@ def meta_decide(
     confidence = _clip(max(p_up_3m, 1.0 - p_up_3m))
 
     no_trade_reason = ""
-    direction = "NEUTRAL"
+    # keep directional hint even inside no-trade regimes; execution layer can still block.
+    direction = "LONG" if p_up_3m >= 0.5 else "SHORT"
     if gray_lo < p_up_3m < gray_hi:
         no_trade_reason = "gray_zone"
     elif regime == "low_liquidity":
         no_trade_reason = "low_liquidity"
-    else:
-        direction = "LONG" if p_up_3m >= 0.5 else "SHORT"
 
     return EnsembleOutput(
         direction=direction,
@@ -92,4 +91,3 @@ def meta_decide(
         confidence=float(confidence),
         no_trade_reason=no_trade_reason,
     )
-

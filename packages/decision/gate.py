@@ -22,6 +22,8 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
     enforce_auc_min = bool(prof.get("enforce_auc_min", False))
     enforce_directional_agreement = bool(prof.get("enforce_directional_agreement", True))
     enforce_high_confidence = bool(prof.get("enforce_high_confidence", False))
+    enforce_model_samples_min = bool(prof.get("enforce_model_samples_min", False))
+    enforce_mtf_alignment = bool(prof.get("enforce_mtf_alignment", False))
 
     rules = []
     reasons = []
@@ -35,7 +37,11 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
 
     samples = int(model_health.get("samples", 0))
     min_samples = int(cfg.get("min_samples", 50))
-    add("MODEL_SAMPLES_MIN", samples >= min_samples, samples, min_samples)
+    samples_ok = samples >= min_samples
+    if samples_ok or enforce_model_samples_min:
+        add("MODEL_SAMPLES_MIN", samples_ok, samples, min_samples)
+    else:
+        add("MODEL_SAMPLES_MIN", True, samples, min_samples, note="soft-check: enforce_model_samples_min=false")
 
     auc = float(model_health.get("auc", 0.0))
     warmup = int(cfg.get("auc_warmup_samples", 600))
@@ -100,11 +106,19 @@ def decide(features: Dict[str, float], inv_results: List[Dict[str, Any]], model_
 
     model_a_direction = str(model_out.get("model_a_direction", ""))
     model_b_direction = str(model_out.get("model_b_direction", ""))
-    if (not enforce_directional_agreement) or (model_b_direction in ("", "NEUTRAL")):
+    if (not enforce_directional_agreement) or (model_a_direction in ("", "NEUTRAL")) or (model_b_direction in ("", "NEUTRAL")):
         agree = True
     else:
-        agree = bool(model_a_direction) and (model_a_direction == model_b_direction)
+        agree = (model_a_direction == model_b_direction)
     add("DIRECTIONAL_AGREEMENT", agree, f"{model_a_direction}/{model_b_direction}", "same")
+
+    trend_60 = str(features.get("trend_dir_60m", "NEUTRAL"))
+    pred_dir = "LONG" if float(model_out.get("pred", 0.0)) >= 0.0 else "SHORT"
+    trend_60_score = abs(float(features.get("trend_score_60m", 0.0) or 0.0))
+    if enforce_mtf_alignment and trend_60 in ("LONG", "SHORT") and trend_60_score >= 0.8:
+        add("MTF_TREND_ALIGNMENT", pred_dir == trend_60, f"{pred_dir}/{trend_60}", "same")
+    else:
+        add("MTF_TREND_ALIGNMENT", True, f"{pred_dir}/{trend_60}", "soft")
 
     costs = float(features.get("costs_bps", 0.0)) / 10000.0
     tp = float(features.get("tp_return", 0.0))

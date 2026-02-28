@@ -11,6 +11,7 @@ def triple_barrier_labels(
     horizon_bars: int = 5,
     tp_atr_mult: float = 1.2,
     sl_atr_mult: float = 1.0,
+    costs_bps: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return labels based on TP-first / SL-first with time barrier.
 
@@ -30,8 +31,9 @@ def triple_barrier_labels(
     for i in range(0, max(0, n - hb)):
         px0 = float(c[i])
         atr_i = max(1e-12, float(a[i]) if i < len(a) else 0.0)
-        up = px0 + tp_atr_mult * atr_i
-        dn = px0 - sl_atr_mult * atr_i
+        cost_px = px0 * float(max(0.0, costs_bps)) / 10000.0
+        up = px0 + tp_atr_mult * atr_i + cost_px
+        dn = px0 - sl_atr_mult * atr_i - cost_px
         label = 0
         for j in range(i + 1, min(n, i + hb + 1)):
             px = float(c[j])

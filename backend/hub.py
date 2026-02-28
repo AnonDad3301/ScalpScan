@@ -198,6 +198,9 @@ class TelegramNotifier:
         self.include_probabilities = bool(tg.get("include_probabilities", True))
         self.include_timing = bool(tg.get("include_timing", True))
         self._last_sent_ts: Dict[str, int] = {}
+        self._sent_event_ids: set[str] = set()
+        self._sent_event_order: list[str] = []
+        self._sent_event_limit = int(tg.get("dedupe_cache_size", 4000) or 4000)
 
     def reconfigure(self, cfg: Dict[str, Any]) -> None:
         self.__init__(cfg)
@@ -213,6 +216,8 @@ class TelegramNotifier:
                 return False
         elif stage == "TRADE_OPEN":
             if not self.send_trade_open:
+                return False
+            if str(payload.get("result", "OK")) != "OK":
                 return False
         elif stage == "TRADE_CLOSED":
             if not self.send_trade_closed:
@@ -242,37 +247,98 @@ class TelegramNotifier:
         except Exception as e:
             return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
 
+    def notify_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        event_id = str(event.get("event_id") or "")
+        if event_id:
+            if event_id in self._sent_event_ids:
+                return {"ok": False, "reason": "already_sent"}
+            self._sent_event_ids.add(event_id)
+            self._sent_event_order.append(event_id)
+            if len(self._sent_event_order) > self._sent_event_limit:
+                old = self._sent_event_order.pop(0)
+                self._sent_event_ids.discard(old)
+        return self.notify(
+            stage=str(event.get("stage", "")),
+            payload=(event.get("payload") if isinstance(event.get("payload"), dict) else {}),
+            symbol=str(event.get("symbol", "*") or "*"),
+            timeframe=str(event.get("timeframe", "") or ""),
+        )
+
+    def _fmt_num(self, v: Any, digits: int = 6) -> str:
+        try:
+            fv = float(v)
+            return f"{fv:.{digits}f}".rstrip("0").rstrip(".")
+        except Exception:
+            return "н/д"
+
+    def _fmt_pct(self, v: Any, digits: int = 1) -> str:
+        try:
+            fv = float(v)
+            if abs(fv) <= 1.0:
+                fv *= 100.0
+            return f"{fv:.{digits}f}%"
+        except Exception:
+            return "н/д"
+
+    def _gate_reason_ru(self, code: str) -> str:
+        mp = {
+            "DIRECTIONAL_AGREEMENT": "нет согласия моделей",
+            "UNCERTAINTY_MAX": "слишком высокая неопределенность",
+            "EV_POSITIVE": "ожидаемая доходность ниже порога",
+            "SPREAD_MAX": "слишком большой спред",
+            "RR_MIN": "низкое риск/прибыль",
+            "AUC_MIN": "низкое качество модели",
+        }
+        c = str(code or "").strip().upper()
+        return mp.get(c, c or "-")
+
     def _format_message(self, stage: str, p: Dict[str, Any], symbol: str, timeframe: str) -> str:
         if stage == "SIGNAL":
             g = p.get("gate", {}) if isinstance(p.get("gate"), dict) else {}
+            reasons = [self._gate_reason_ru(x) for x in (g.get("reasons", []) or [])]
             lines = [
                 f"📡 <b>Сигнал</b> {symbol} ({timeframe})",
                 f"Направление: <b>{p.get('direction')}</b>",
             ]
             if self.include_probabilities:
-                lines.append(f"P3/P5: {p.get('p_up_3m')} / {p.get('p_up_5m')} | TP/SL-first: {p.get('p_tp_first')} / {p.get('p_sl_first')}")
-            lines.append(f"Pred/Conf: {p.get('pred')} / {p.get('confidence')}")
+                lines.append(f"Вероятность LONG (3m/5m): <b>{self._fmt_pct(p.get('p_up_3m'))}</b> / <b>{self._fmt_pct(p.get('p_up_5m'))}</b>")
+                lines.append(f"Вероятность SHORT (3m/5m): <b>{self._fmt_pct(p.get('p_down_3m'))}</b> / <b>{self._fmt_pct(p.get('p_down_5m'))}</b>")
+                lines.append(f"TP раньше SL: {self._fmt_pct(p.get('p_tp_first'))} | SL раньше TP: {self._fmt_pct(p.get('p_sl_first'))}")
+                lines.append(f"Пробой вверх/вниз: {self._fmt_pct(p.get('p_breakout_up'))} / {self._fmt_pct(p.get('p_breakout_down'))}")
+            lines.append(f"Сила сигнала: {self._fmt_pct(p.get('signal_strength'))} | Уверенность: {self._fmt_pct(p.get('confidence'))}")
             if self.include_volatility:
-                lines.append(f"Regime: {p.get('market_regime')} | Signal strength: {p.get('signal_strength')}")
-            lines.append(f"Gate: {g.get('decision')} | Причины: {','.join(g.get('reasons', []) or [])}")
+                lines.append(f"Режим: {p.get('market_regime')} | Волатильность: {self._fmt_pct(p.get('volatility_pct'))}")
+                lines.append(f"ATR percentile: {self._fmt_pct(p.get('atr_percentile'))}")
+            lines.append(f"Gate: <b>{g.get('decision')}</b> | Причины: {', '.join(reasons) if reasons else '-'}")
             if self.include_levels:
-                lines.append(f"Entry: {p.get('entry')} | SL: {p.get('sl')} | TP1: {p.get('tp1')} | TP2: {p.get('tp2')}")
+                lines.append(f"Вход: {self._fmt_num(p.get('entry'))} | SL: {self._fmt_num(p.get('sl'))} | TP1: {self._fmt_num(p.get('tp1'))} | TP2: {self._fmt_num(p.get('tp2'))}")
+                lines.append(f"Поддержка/сопротивление: {self._fmt_num(p.get('support_level'))} / {self._fmt_num(p.get('resistance_level'))}")
             if self.include_timing:
                 lines.append(f"ts={now_ms()}")
             return "\n".join(lines)
         if stage == "TRADE_OPEN":
             lines = [f"🟢 <b>Позиция открыта</b> {symbol}"]
+            lines.append(f"Сторона: {p.get('side')} | Entry: {self._fmt_num(p.get('entry'))}")
             if self.include_positions:
-                lines.append(f"Qty: {p.get('qty')} | Notional: {p.get('notional')}")
-                lines.append(f"SL: {p.get('sl')} | TP1: {p.get('tp1')} | TP2: {p.get('tp2')}")
+                lines.append(f"Объем: {self._fmt_num(p.get('qty'))} | Номинал: {self._fmt_num(p.get('notional'), 2)}")
+                lines.append(f"SL: {self._fmt_num(p.get('sl'))} | TP1: {self._fmt_num(p.get('tp1'))} | TP2: {self._fmt_num(p.get('tp2'))}")
             if self.include_timing:
                 lines.append(f"ts={now_ms()}")
             return "\n".join(lines)
         if stage == "TRADE_CLOSED":
             lines = [f"🔴 <b>Позиция закрыта</b> {symbol}"]
             if self.include_positions:
-                lines.append(f"Причина: {p.get('reason')}")
-                lines.append(f"Entry: {p.get('entry')} | Exit: {p.get('exit')} | PnL: <b>{p.get('pnl')}</b>")
+                lines.append(f"Сторона: {p.get('side')} | Причина: {p.get('reason')}")
+                lines.append(
+                    f"Entry: {self._fmt_num(p.get('entry'))} | Exit: {self._fmt_num(p.get('exit'))} | "
+                    f"PnL: <b>{self._fmt_num(p.get('pnl'), 2)}</b>"
+                )
+                trade_ref = p.get("open_trade_event_id") or p.get("trade_id") or p.get("position_id") or "-"
+                signal_ref = p.get("signal_event_id") or p.get("signal_id") or "-"
+                lines.append(f"TradeRef: <code>{trade_ref}</code>")
+                lines.append(f"SignalRef: <code>{signal_ref}</code>")
+                if p.get("open_ts") or p.get("close_ts"):
+                    lines.append(f"Open ts: {p.get('open_ts', '-')} | Close ts: {p.get('close_ts', '-')}")
             if self.include_timing:
                 lines.append(f"ts={now_ms()}")
             return "\n".join(lines)
@@ -506,6 +572,16 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
                 "MODEL_B_LOAD_START","MODEL_B_LOAD_END","MODEL_B_INFERRED",
                 "MODEL_B_DATASET_APPEND","MODEL_B_STATUS","MODEL_B_RETRAIN","MODEL_B_RETRAIN_SKIPPED","MODEL_B_TRAINING_STATUS","MODEL_B_PROMOTED"
             )]
+            try:
+                if telegram_notifier is not None:
+                    for e in reversed(interesting):
+                        if e.get("stage") not in ("SIGNAL", "TRADE_OPEN", "TRADE_CLOSED"):
+                            continue
+                        r = telegram_notifier.notify_event(e)
+                        if isinstance(r, dict) and (not r.get("ok", False)) and r.get("reason") not in ("filtered_or_disabled", "empty_message", "already_sent"):
+                            append_event(es, rt, "TELEGRAM_ERROR", {"stage": e.get("stage"), "event_id": e.get("event_id"), **r}, run_id="events", level="ERROR", symbol=str(e.get("symbol", "*")))
+            except Exception:
+                pass
             liveness["events"] = time.monotonic()
             await broadcast({"type": "events", "ts": now_ms(), "events": list(reversed(interesting))[-350:]})
             await asyncio.sleep(1.0)
@@ -538,7 +614,10 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
                                 continue
                             STATE["last_cmd_id"]=cid
                             c=cmd.get("cmd")
-                            if c=="force_model_b_retrain":
+                            if c in ("run_preflight", "start", "stop", "sync_symbols", "get_symbols"):
+                                await COMMANDS.enqueue(cmd)
+                                append_event(es, rt, "CMD", {"cmd": c, "status": "queued"}, run_id="cmd", level="INFO")
+                            elif c=="force_model_b_retrain":
                                 STATE["force_model_b_retrain"]=True
                                 append_event(es, rt, "CMD", {"cmd": c}, run_id="cmd", level="INFO")
                             elif c=="disable_model_b_training":

@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
 from PySide6.QtCore import Qt, Signal
-import websockets
 from websockets.legacy.client import connect as legacy_connect
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +24,20 @@ def fmt_ts(ts_ms: Any) -> str:
         return ""
 
 
+def _sparkline(values: List[float], width: int = 24) -> str:
+    if not values:
+        return "—"
+    vals = values[-width:]
+    lo = min(vals); hi = max(vals)
+    bars = "▁▂▃▄▅▆▇█"
+    if hi - lo < 1e-12:
+        return bars[0] * len(vals)
+    out = []
+    for v in vals:
+        idx = int((v - lo) / (hi - lo) * (len(bars) - 1))
+        out.append(bars[max(0, min(len(bars)-1, idx))])
+    return "".join(out)
+
 
 def write_cmd(cfg: Dict[str, Any], cmd: str, **kwargs) -> None:
     """Write UI command to data/ui_commands.jsonl for hub cmd_loop consumption."""
@@ -37,6 +50,7 @@ def write_cmd(cfg: Dict[str, Any], cmd: str, **kwargs) -> None:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 class WSClient(QtCore.QThread):
+    """Hybrid transport: receive status via websocket, send commands via file queue."""
     message = Signal(dict)
     status = Signal(str)
     connected = Signal(bool)
@@ -45,62 +59,37 @@ class WSClient(QtCore.QThread):
         super().__init__()
         self.url = url
         self._stop = False
-        self._out_q: Optional[asyncio.Queue] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     def stop(self):
         self._stop = True
-        if self._loop:
-            self._loop.call_soon_threadsafe(lambda: None)
 
     def send_cmd(self, cmd: str, **kwargs):
-        payload = {"type":"cmd","ts":int(time.time()*1000),"cmd":cmd}
-        payload.update(kwargs)
-        if self._loop and self._out_q:
-            def _put():
-                try:
-                    self._out_q.put_nowait(payload)
-                except Exception:
-                    pass
-            self._loop.call_soon_threadsafe(_put)
+        # keep robust command path independent of websocket runtime
+        write_cmd({}, cmd, **kwargs)
 
     def run(self):
         asyncio.run(self._main())
 
     async def _main(self):
-        self._loop = asyncio.get_running_loop()
-        self._out_q = asyncio.Queue()
         while not self._stop:
             try:
                 self.status.emit(f"WS connect: {self.url}")
                 async with legacy_connect(self.url, ping_interval=None, ping_timeout=None) as ws:
                     self.connected.emit(True)
                     self.status.emit("WS connected")
-
-                    async def sender():
-                        while not self._stop:
-                            msg = await self._out_q.get()
-                            try:
-                                await ws.send(json.dumps(msg, ensure_ascii=False))
-                            except Exception:
-                                break
-
-                    send_task = asyncio.create_task(sender())
-                    try:
-                        async for raw in ws:
-                            if self._stop:
-                                break
-                            try:
-                                self.message.emit(json.loads(raw))
-                            except Exception:
-                                continue
-                    finally:
-                        send_task.cancel()
-                        self.connected.emit(False)
+                    async for raw in ws:
+                        if self._stop:
+                            break
+                        try:
+                            self.message.emit(json.loads(raw))
+                        except Exception:
+                            continue
             except Exception as e:
                 self.connected.emit(False)
                 self.status.emit(f"WS reconnect in 1s: {e}")
                 await asyncio.sleep(1.0)
+
+
 
 class Table(QtWidgets.QTableWidget):
     def __init__(self, headers: List[str]):
@@ -179,6 +168,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tab_mlops()
         self._tab_levels()
         self._tab_performance()
+        self._tab_analytics()
         self._tab_settings()
         self._tab_logs()
 
@@ -347,6 +337,51 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tbl_prob=SimpleTable(["Время","Символ","P(up 3m)","P(up 5m)","TP-first","SL-first","Signal","EV","Regime","ret_3m","ret_5m"])
         lay.addWidget(self.tbl_prob)
         self.tabs.addTab(w, "Эффективность")
+
+    def _kpi_card(self, title: str) -> QtWidgets.QLabel:
+        lab = QLabel(f"{title}: —")
+        lab.setStyleSheet("font-size:16px; font-weight:700; background:#1f2937; color:#e5e7eb; border-radius:10px; padding:10px;")
+        return lab
+
+    def _tab_analytics(self):
+        w=QWidget(); lay=QVBoxLayout(w)
+        info=QLabel("Статистика системы: качество сканирования, сигналы, открытие/закрытие сделок, обучение моделей. Обновляется из events.sqlite в реальном времени.")
+        info.setWordWrap(True); lay.addWidget(info)
+
+        cards=QHBoxLayout()
+        self.kpi_sig_total=self._kpi_card("Сигналы")
+        self.kpi_sig_pass=self._kpi_card("PASS")
+        self.kpi_opened=self._kpi_card("Открыто")
+        self.kpi_closed=self._kpi_card("Закрыто")
+        self.kpi_winrate=self._kpi_card("WinRate")
+        for c in (self.kpi_sig_total,self.kpi_sig_pass,self.kpi_opened,self.kpi_closed,self.kpi_winrate):
+            cards.addWidget(c)
+        lay.addLayout(cards)
+
+        bars=QHBoxLayout()
+        self.pb_signal_pass=QtWidgets.QProgressBar(); self.pb_signal_pass.setFormat("Signal PASS rate: %p%")
+        self.pb_trade_win=QtWidgets.QProgressBar(); self.pb_trade_win.setFormat("Trade win rate: %p%")
+        self.pb_scan_cov=QtWidgets.QProgressBar(); self.pb_scan_cov.setFormat("Scan coverage: %p%")
+        self.lbl_graph_scan=QLabel("Scan trend: —")
+        self.lbl_graph_signal=QLabel("Signal trend: —")
+        for b in (self.pb_signal_pass,self.pb_trade_win,self.pb_scan_cov):
+            b.setRange(0,100); b.setValue(0); bars.addWidget(b)
+        lay.addLayout(bars)
+        lay.addWidget(self.lbl_graph_scan)
+        lay.addWidget(self.lbl_graph_signal)
+
+        split=QHBoxLayout()
+        left=QVBoxLayout(); right=QVBoxLayout()
+        self.tbl_stats_models=SimpleTable(["Метрика","Значение"])
+        self.tbl_stats_trades=SimpleTable(["Метрика","Значение"])
+        self.tbl_stats_scan=SimpleTable(["Время","Coverage %","Pass %","Error %","Processed","Errors"])
+        left.addWidget(QLabel("Модели/обучение")); left.addWidget(self.tbl_stats_models)
+        right.addWidget(QLabel("Торговля/сигналы")); right.addWidget(self.tbl_stats_trades)
+        split.addLayout(left); split.addLayout(right)
+        lay.addLayout(split)
+        lay.addWidget(QLabel("История сканера (последние тики)"))
+        lay.addWidget(self.tbl_stats_scan)
+        self.tabs.addTab(w, "Статистика")
 
     def _tab_settings(self):
         w=QWidget(); lay=QVBoxLayout(w)
@@ -525,7 +560,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # SQLite polling (IMPORTANT: tail() returns newest first)
     def poll_sqlite(self):
-        tail = self.es.tail(2500)  # newest first
+        tail = self.es.tail(12000)  # newest first (wider window for analytics)
         self.events = list(reversed(tail))  # for tables (oldest->newest)
 
         for e in tail:
@@ -547,6 +582,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 if mh:
                     self.model_health = mh
                 break
+            if e.get("stage") == "MODEL_A_STATUS":
+                mh = (e.get("payload") or {})
+                if mh:
+                    self.model_health = mh
+                break
         for e in tail:
             if e.get("stage") == "TRADE_OUTCOME_STATS":
                 self.trade_outcome_stats = (e.get("payload") or {})
@@ -555,7 +595,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def refresh_ui(self):
         now = int(time.time()*1000)
         age = (now - self.last_ws_msg_ts) if self.last_ws_msg_ts else None
-        self.lbl_live.setText(f"Live: WS={'OK' if self.ws_connected else 'NO'} | last_msg={age}ms" if age is not None else f"Live: WS={'OK' if self.ws_connected else 'NO'}")
+        self.lbl_live.setText(f"Live: {'WS OK' if self.ws_connected else 'WS NO'} | last_msg={age}ms" if age is not None else f"Live: {'WS OK' if self.ws_connected else 'WS NO'}")
 
         self.lbl_pf.setText("Предпроверка: " + ("OK ✅" if self.preflight_ok else "НЕ ПРОЙДЕНА ❌"))
         self.tbl_pf.set_rows([[r.get("name"), "OK" if r.get("ok") else "FAIL", r.get("details","")] for r in (self.preflight_report or [])])
@@ -590,7 +630,7 @@ class MainWindow(QtWidgets.QMainWindow):
         modelb_rows=[]; mlops_rows=[]; levels_rows=[]; perf_rows=[]
         modelb_status=None
         dataset_rows=None
-        for e in self.events[-1400:]:
+        for e in self.events[-10000:]:
             ts=fmt_ts(e.get("ts")); sym=e.get("symbol"); stg=e.get("stage"); lvl=e.get("level"); payload=e.get("payload",{})
             if stg=="SIGNAL":
                 gate=payload.get("gate",{}) or {}
@@ -660,7 +700,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pb_auc.setValue(0)
 
         ds_path = ""
-        for e in reversed(self.events[-2000:]):
+        for e in reversed(self.events[-12000:]):
             if e.get("stage") == "MODEL_B_STATUS":
                 ds_path = str((e.get("payload") or {}).get("dataset_path", ""))
                 break
@@ -668,7 +708,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pos_rate = float((modelb_status or {}).get("dataset_pos_rate", 0.0) or 0.0)
         self.lbl_ds.setText(f"Dataset: {rows_val} rows | positive_rate={pos_rate:.2%}")
         last_ds_ts = ""
-        for e in reversed(self.events[-2000:]):
+        for e in reversed(self.events[-12000:]):
             if e.get("stage") == "MODEL_B_DATASET_APPEND":
                 last_ds_ts = fmt_ts(e.get("ts"))
                 break
@@ -695,12 +735,102 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_perf.setText(f"Сделки: всего={total_closed}, прибыльных={wins}, убыточных={loss}, SL={sl}, BE={be}, win_rate={win_rate:.1%} | Model-B progress={mb_prog:.0%}, reason={mb_reason}")
 
         prob_rows=[]
-        for e in self.events[-1500:]:
+        for e in self.events[-12000:]:
             if e.get("stage") == "SHORT_TERM_LEVEL_PROB":
                 p=e.get("payload",{})
                 prob_rows.append([fmt_ts(e.get("ts")), e.get("symbol"), f"{float(p.get('p_up_3m',0.0)):.2%}", f"{float(p.get('p_up_5m',0.0)):.2%}", "—", "—", "—", "—", "—", f"{float(p.get('ret_3m',0.0)):.4f}", f"{float(p.get('ret_5m',0.0)):.4f}"])
         merged = (prob_rows + perf_rows)[-400:]
         self.tbl_prob.set_rows(merged[-250:])
+
+        # analytics tab (aggregated system statistics)
+        signal_total = 0
+        signal_pass = 0
+        signal_fail = 0
+        trade_open_total = 0
+        trade_closed_total = 0
+        close_sl = 0
+        close_tp = 0
+        for e in self.events[-12000:]:
+            stg = e.get("stage")
+            p = e.get("payload") or {}
+            if stg == "SIGNAL":
+                signal_total += 1
+                g = p.get("gate") or {}
+                if str(g.get("decision", "")).upper() == "PASS":
+                    signal_pass += 1
+                else:
+                    signal_fail += 1
+            elif stg == "TRADE_OPEN":
+                if str(p.get("result", "OK")) == "OK":
+                    trade_open_total += 1
+            elif stg == "TRADE_CLOSED":
+                trade_closed_total += 1
+                r = str(p.get("reason", ""))
+                if r == "SL":
+                    close_sl += 1
+                elif r in ("TP1", "TP2"):
+                    close_tp += 1
+
+        signal_pass_rate = (100.0 * signal_pass / max(1, signal_total))
+        trade_win_rate = float(win_rate * 100.0)
+        scan_cov = 0.0
+        scan_pass = 0.0
+        scan_err = 0.0
+        scan_rows = []
+        for e in self.events[-12000:]:
+            if e.get("stage") == "SCAN_EFFICIENCY":
+                p = e.get("payload") or {}
+                scan_cov = float(p.get("coverage_pct", scan_cov) or 0.0)
+                scan_pass = float(p.get("pass_rate_pct", scan_pass) or 0.0)
+                scan_err = float(p.get("error_rate_pct", scan_err) or 0.0)
+                scan_rows.append([
+                    fmt_ts(e.get("ts")),
+                    f"{float(p.get('coverage_pct',0.0)):.1f}",
+                    f"{float(p.get('pass_rate_pct',0.0)):.1f}",
+                    f"{float(p.get('error_rate_pct',0.0)):.1f}",
+                    int(p.get("processed",0) or 0),
+                    int(p.get("errors",0) or 0),
+                ])
+
+        self.kpi_sig_total.setText(f"Сигналы: {signal_total}")
+        self.kpi_sig_pass.setText(f"PASS: {signal_pass} ({signal_pass_rate:.1f}%)")
+        self.kpi_opened.setText(f"Открыто: {trade_open_total}")
+        self.kpi_closed.setText(f"Закрыто: {trade_closed_total}")
+        self.kpi_winrate.setText(f"WinRate: {trade_win_rate:.1f}%")
+        self.pb_signal_pass.setValue(int(max(0,min(100, round(signal_pass_rate)))))
+        self.pb_trade_win.setValue(int(max(0,min(100, round(trade_win_rate)))))
+        self.pb_scan_cov.setValue(int(max(0,min(100, round(scan_cov)))))
+
+        self.tbl_stats_models.set_rows([
+            ["Model-A samples", int(mh.get("samples", 0) or 0)],
+            ["Model-A AUC", f"{float(mh.get('auc',0.0) or 0.0):.3f}"],
+            ["Model-A accuracy", f"{float(mh.get('accuracy',0.0) or 0.0):.3f}"],
+            ["Model-B dataset rows", int((modelb_status or {}).get("dataset_rows",0) or 0)],
+            ["Model-B pos rate", f"{float((modelb_status or {}).get('dataset_pos_rate',0.0) or 0.0):.2%}"],
+            ["Model-B progress", f"{float((modelb_status or {}).get('training_progress',0.0) or 0.0):.0%}"],
+            ["Model-B retrain reason", str((modelb_status or {}).get("last_retrain_reason", "n/a"))],
+        ])
+        self.tbl_stats_trades.set_rows([
+            ["Signals total", signal_total],
+            ["Signals PASS", signal_pass],
+            ["Signals FAIL", signal_fail],
+            ["Trades open", trade_open_total],
+            ["Trades closed", trade_closed_total],
+            ["Closed by TP", close_tp],
+            ["Closed by SL", close_sl],
+            ["Win rate", f"{trade_win_rate:.1f}%"],
+            ["Scanner pass rate", f"{scan_pass:.1f}%"],
+            ["Scanner error rate", f"{scan_err:.1f}%"],
+        ])
+        self.tbl_stats_scan.set_rows(scan_rows[-120:])
+        scan_pass_hist = [float(r[2]) for r in scan_rows[-40:] if isinstance(r[2], str)]
+        signal_hist = []
+        for e in self.events[-12000:]:
+            if e.get("stage") == "SIGNAL":
+                g = (e.get("payload") or {}).get("gate") or {}
+                signal_hist.append(100.0 if str(g.get("decision","")) == "PASS" else 0.0)
+        self.lbl_graph_scan.setText(f"Scan trend: {_sparkline(scan_pass_hist)}")
+        self.lbl_graph_signal.setText(f"Signal PASS trend: {_sparkline(signal_hist)}")
 
         # last command feedback (telegram test / reload config)
         for e in reversed(self.events[-500:]):
@@ -745,7 +875,7 @@ class MainWindow(QtWidgets.QMainWindow):
             buf.append('')
 
         for e in self.events[-500:]:
-            if e.get("stage") in ("PRICE_TICK","ERROR","TRADE_OPEN","TRADE_CLOSED","MODEL_B_STATUS","MODEL_B_RETRAIN","MODEL_B_RETRAIN_SKIPPED","POSITION_UPDATE","TRADE_OUTCOME_STATS","SHORT_TERM_LEVEL_PROB"):
+            if e.get("stage") in ("PRICE_TICK","ERROR","TRADE_OPEN","TRADE_CLOSED","MODEL_A_STATUS","MODEL_B_STATUS","MODEL_B_RETRAIN","MODEL_B_RETRAIN_SKIPPED","POSITION_UPDATE","TRADE_OUTCOME_STATS","SHORT_TERM_LEVEL_PROB"):
                 buf.append(f"{fmt_ts(e.get('ts'))} {e.get('stage')} {e.get('symbol')} {json.dumps(e.get('payload',{}), ensure_ascii=False)[:500]}")
         self.txt_mon.setPlainText("\n".join(buf[-250:]) if buf else "Пока нет событий. Запусти hub и нажми Старт сканера.")
 
