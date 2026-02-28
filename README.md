@@ -128,3 +128,15 @@ v1.3.8: POSITIONS_SNAPSHOT persisted; WS ping disabled; websockets logs silenced
   - секция `modernization` для тюнинга сканера/форкастера/детектора режима.
 
 - PRICE_TICK получает статус `DEGRADED`, если WS подключен, но канал устарел/не даёт тикеров; UI показывает этот режим отдельно.
+
+## v1.8.0 (Bitget data adapter + similarity/simulation)
+- Добавлен `BitgetPublicWS` и фабрика `build_public_ws_client` для выбора публичного WS-адаптера по `runtime.exchange` (`bybit`/`bitget`).
+- Hub теперь автоматически использует соответствующий адаптер рыночных данных без изменения runtime-loop.
+- В runtime добавлены новые события аналитического контура:
+  - `PATTERN_SIMILARITY` (top-K похожих исторических состояний + вероятности up/down/flat),
+  - `SIMULATION_SCENARIOS` (bullish/bearish/neutral/false-breakout + confidence),
+  - `FORECAST_4M` (вероятностный прогноз на 4 минуты).
+- Добавлены модули модернизации:
+  - `PatternSimilarityEngine`,
+  - `ScenarioSimulationEngine`,
+  - `HistoricalDataLoader` (dedup + gap check для backfill).
