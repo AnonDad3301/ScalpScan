@@ -253,6 +253,7 @@ class Engine:
         scan_stats = {
             "symbols_total": len(symbols),
             "symbols_tick": len(tick_symbols),
+            "attempted": len(tick_symbols),
             "processed": 0,
             "inv_fail": 0,
             "gate_pass": 0,
@@ -261,6 +262,7 @@ class Engine:
         }
 
         for sym in tick_symbols:
+            scan_stats["processed"] += 1
             env=dict(base); env["symbol"]=sym
             try:
                 sp1=self.telemetry.span_start('FETCH_OHLCV', trace_id=run_id, symbol=sym)
@@ -282,6 +284,15 @@ class Engine:
                     "spread":ob.get("spread"),
                     "imb":ob.get("imbalance")
                 }))
+
+                min_rows = max(24, int(rt.get("lookback", 0) or 0) // 4, int(self.cfg.get("model", {}).get("forward", 4) or 4) + 6)
+                if len(ohlcv) < min_rows:
+                    self.es.append(mk_event(env, "DATA_INSUFFICIENT", "INFO", {
+                        "ohlcv_rows": len(ohlcv),
+                        "required_rows": min_rows,
+                        "reason": "SHORT_OHLCV",
+                    }))
+                    continue
 
                 feats=compute_features(ohlcv, ob)
                 try:
@@ -411,6 +422,14 @@ class Engine:
                 added=self.trainer.add_samples(X[:-fwd], y[:-fwd])
                 scan_stats["samples_added"] += int(added)
                 pass  # retrain throttled
+
+                if X.shape[0] == 0:
+                    self.es.append(mk_event(env, "DATA_INSUFFICIENT", "INFO", {
+                        "ohlcv_rows": len(ohlcv),
+                        "required_rows": 1,
+                        "reason": "EMPTY_MODEL_A_MATRIX",
+                    }))
+                    continue
 
                 x_last=X[-1]
                 mout=self.trainer.infer(x_last)
@@ -633,11 +652,13 @@ class Engine:
                     if res.get("result") == "OK":
                         self._open_trade_meta[sym] = {**trade_meta, "open_trade_event_id": trade_open_event.get("event_id")}
 
-                scan_stats["processed"] += 1
-
             except Exception as e:
                 scan_stats["errors"] += 1
-                self.es.append(mk_event(env,"ERROR","ERROR",{"error":str(e)}))
+                self.es.append(mk_event(env,"ERROR","ERROR",{
+                    "where": "tick_symbol",
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                }))
         # retrain model at most once per interval (prevents stalls)
 
         # retrain Model B head on accumulated labeled samples (scheduled)
@@ -757,7 +778,7 @@ class Engine:
             **scan_stats,
             "coverage_pct": float(100.0 * scan_stats["symbols_tick"] / max(1, scan_stats["symbols_total"])),
             "pass_rate_pct": float(100.0 * scan_stats["gate_pass"] / max(1, scan_stats["processed"])),
-            "error_rate_pct": float(100.0 * scan_stats["errors"] / max(1, scan_stats["symbols_tick"])),
+            "error_rate_pct": float(100.0 * scan_stats["errors"] / max(1, scan_stats["processed"])),
         }))
         # Model-B status heartbeat
         try:
