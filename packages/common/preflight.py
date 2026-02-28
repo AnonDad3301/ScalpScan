@@ -44,7 +44,7 @@ def validate_config(cfg: Dict[str, Any]) -> List[CheckResult]:
     res.append(CheckResult("price_interval_sec>=0.1", price >= 0.1, f"{price}"))
 
     host = str(rt.get("ws_host", "127.0.0.1"))
-    port = int(rt.get("ws_port", 8765))
+    port = int(rt.get("ws_port", 8766))
     ok, details = _port_status(host, port)
     res.append(CheckResult("ws_port_ready", ok, f"{host}:{port} ({details})"))
 

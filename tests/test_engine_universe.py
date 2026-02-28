@@ -58,6 +58,16 @@ class EngineUniverseTests(unittest.TestCase):
         out = eng.universe()
         self.assertEqual(out, ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT"])
 
+    def test_universe_handles_invalid_custom_symbols_type(self):
+        eng = self._mk_engine(
+            strict=["BTC/USDT:USDT"],
+            relaxed=["BTC/USDT:USDT", "ETH/USDT:USDT"],
+            custom=0.5,
+            max_pairs=3,
+        )
+        out = eng.universe()
+        self.assertEqual(out, ["BTC/USDT:USDT", "ETH/USDT:USDT"])
+
 
 if __name__ == "__main__":
     unittest.main()

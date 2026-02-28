@@ -354,6 +354,7 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
     ws_resub_ms = int(rt.get("ws_stale_resub_ms", 3000))
     ws_reconnect_ms = int(rt.get("ws_stale_reconnect_ms", 10000))
     ws_zero_ticks_limit = int(rt.get("ws_zero_ticks_limit", 5))
+    ws_tick_grace_cycles = int(rt.get("ws_tick_grace_cycles", 2))
     ws_zero_ticks = 0
 
     stall_sec = float(rt.get("watchdog_stall_sec", 20.0))
@@ -413,6 +414,11 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
                 uni_syms = []
             syms = list(dict.fromkeys(open_syms + uni_syms))[: int(rt.get("max_pairs", 50) or 50)]
             ws_connected=False; ws_stale_ms=None; ws_ticker_1s=None; ws_sub_ok=None; ws_sub_err=None
+            ws_degraded = False; ws_reason = ""
+            try:
+                await ws_client.set_desired(syms)
+            except Exception:
+                pass
             try:
                 _, st = await ws_client.get_prices()
                 ws_connected = bool(st.connected)
@@ -420,10 +426,6 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
                 ws_sub_ok = int(st.sub_ok)
                 ws_sub_err = int(st.sub_err)
                 ws_stale_ms = int(time.time()*1000) - int(st.last_msg_ms)
-            except Exception:
-                pass
-            try:
-                await ws_client.set_desired(syms)
             except Exception:
                 pass
             # auto-fix WS pong-only
@@ -439,10 +441,6 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
                 if ws_zero_ticks >= ws_zero_ticks_limit:
                     await ws_client.request_reconnect()
                     ws_zero_ticks = 0
-            except Exception:
-                pass
-            try:
-                await ws_client.set_desired(syms)
             except Exception:
                 pass
             prices: Dict[str, float] = {}
@@ -461,10 +459,13 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
                     stale = True
                     try:
                         if ws_state and ws_state.connected:
-                            stale = (int(time.time()*1000) - int(ws_state.last_msg_ms)) > 3000
+                            stale = (int(time.time()*1000) - int(ws_state.last_msg_ms)) > ws_resub_ms
                     except Exception:
                         stale = True
                     missing = [s for s in syms if s not in prices]
+                    if ws_connected and (stale or (len(syms) > 0 and len(missing) == len(syms) and ws_zero_ticks >= ws_tick_grace_cycles)):
+                        ws_degraded = True
+                        ws_reason = "stale" if stale else "no_ticker_updates"
                     if missing or stale:
                         prices2, pm = price_worker.fetch_prices(syms, timeout_sec=price_timeout)
                         if isinstance(prices2, dict):
@@ -483,12 +484,26 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
                             'url': ws_state.conn_url,
                             'stale': stale,
                             'missing_n': len(missing),
+                            'desired_n': getattr(ws_state, 'desired_n', 0),
+                            'subscribed_n': getattr(ws_state, 'subscribed_n', 0),
+                            'degraded': ws_degraded,
+                            'degraded_reason': ws_reason,
+                            'last_error': getattr(ws_state, 'last_error', ''),
                         }, run_id='price')
                 if not isinstance(prices, dict):
                     prices = {}
-                if syms and pm.get("status") != "OK":
-                    append_event(es, rt, "PRICE_WORKER", pm, run_id="price", level="ERROR")
-
+                if ws_degraded:
+                    append_event(es, rt, "PRICE_DEGRADED", {
+                        "reason": ws_reason,
+                        "ws_connected": ws_connected,
+                        "ws_stale_ms": ws_stale_ms,
+                        "ws_ticker_1s": ws_ticker_1s,
+                        "ws_sub_ok": ws_sub_ok,
+                        "ws_sub_err": ws_sub_err,
+                        "tracked_symbols": len(syms),
+                    }, run_id="price", level="ERROR")
+                    if status == "OK":
+                        status = "DEGRADED"
 
                 # fallback: if some symbols missing, use last_prices or last 1m close
                 missing = [s for s in syms if s not in prices]
@@ -549,7 +564,7 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
 
             dt_ms = int((time.time()-t0)*1000)
             liveness["price"] = time.monotonic()
-            append_event(es, rt, "PRICE_TICK", {"open_positions": len(open_syms), "tracked_symbols": len(syms), "prices_n": len(prices), "dt_ms": dt_ms, "status": status, "symbols": syms[:50], "ws_connected": ws_connected, "ws_stale_ms": ws_stale_ms, "ws_ticker_1s": ws_ticker_1s, "ws_sub_ok": ws_sub_ok, "ws_sub_err": ws_sub_err}, run_id="price")
+            append_event(es, rt, "PRICE_TICK", {"open_positions": len(open_syms), "tracked_symbols": len(syms), "prices_n": len(prices), "dt_ms": dt_ms, "status": status, "symbols": syms[:50], "ws_connected": ws_connected, "ws_stale_ms": ws_stale_ms, "ws_ticker_1s": ws_ticker_1s, "ws_sub_ok": ws_sub_ok, "ws_sub_err": ws_sub_err, "ws_degraded": ws_degraded, "ws_degraded_reason": ws_reason}, run_id="price")
 
             try:
                 sp = tele.span_start("PRICE_TICK", trace_id="price_tick", symbol="*", open_positions=len(open_syms), tracked_symbols=len(syms))
@@ -564,7 +579,7 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
             tail = es.tail(500)
             interesting = [e for e in tail if e["stage"] in (
                 "SIGNAL","TRADE_OPEN","TRADE_CLOSED","POSITION_UPDATE","ERROR",
-                "PRICE_TICK","PRICE_TIMEOUT","PRICE_ERROR",
+                "PRICE_TICK","PRICE_TIMEOUT","PRICE_ERROR","PRICE_DEGRADED",
                 "TICK_TIMEOUT","TICK_ERROR","TICK_DONE",
                 "ACCOUNT","PRICES_SNAPSHOT","POSITIONS_SNAPSHOT",
                 "MODEL_INFERRED","MODEL_TRADE_SAMPLE","MODEL_RETRAIN_SKIPPED","GATE_DECISION","STALL_DETECTED",
@@ -734,7 +749,7 @@ async def main():
     STATE["preflight_report"] = rep
 
     host = rt.get("ws_host", "127.0.0.1")
-    port = int(rt.get("ws_port", 8765))
+    port = int(rt.get("ws_port", 8766))
     mon_host = rt.get("monitoring_host", "127.0.0.1")
     mon_port = int(rt.get("monitoring_port", 8081))
     mon_server = await start_monitoring_api(mon_host, mon_port, STATE)

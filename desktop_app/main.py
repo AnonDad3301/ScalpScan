@@ -126,13 +126,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cfg = cfg
         self.cfg_path = cfg_path
         self.root_dir = os.path.dirname(os.path.abspath(cfg_path))
-        self.setWindowTitle("ScalpForge Desktop v1.4.3 (No Docker)")
+        self.setWindowTitle("ScalpForge Desktop v1.7.0 (No Docker)")
         self.resize(1600, 1000)
         self._apply_theme()
 
         rt = cfg.get("runtime", {})
         host = rt.get("ws_host", "127.0.0.1")
-        port = int(rt.get("ws_port", 8765))
+        port = int(rt.get("ws_port", 8766))
         self.ws_url = f"ws://{host}:{port}"
 
         self.es = SQLiteEventStore(os.path.join(self.root_dir, cfg["storage"]["events_db"]))
@@ -141,6 +141,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # state
         self.ws_connected = False
         self.last_ws_msg_ts = 0
+        self.last_price_tick = {}
         self.preflight_ok = False
         self.preflight_report: List[Dict[str, Any]] = []
         self.symbols: List[str] = []
@@ -564,6 +565,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.events = list(reversed(tail))  # for tables (oldest->newest)
 
         for e in tail:
+            if e.get("stage") == "PRICE_TICK":
+                self.last_price_tick = (e.get("payload") or {})
+                break
+        for e in tail:
             if e.get("stage") == "PRICES_SNAPSHOT":
                 self.prices = (e.get("payload", {}).get("prices") or {})
                 break
@@ -595,7 +600,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def refresh_ui(self):
         now = int(time.time()*1000)
         age = (now - self.last_ws_msg_ts) if self.last_ws_msg_ts else None
-        self.lbl_live.setText(f"Live: {'WS OK' if self.ws_connected else 'WS NO'} | last_msg={age}ms" if age is not None else f"Live: {'WS OK' if self.ws_connected else 'WS NO'}")
+        ws_mode = "WS DEGRADED" if bool((self.last_price_tick or {}).get("ws_degraded")) else ("WS OK" if self.ws_connected else "WS NO")
+        ws_reason = str((self.last_price_tick or {}).get("ws_degraded_reason", ""))
+        if age is not None:
+            extra = f" | mode={ws_mode}" + (f" ({ws_reason})" if ws_reason else "")
+            self.lbl_live.setText(f"Live: {'WS OK' if self.ws_connected else 'WS NO'} | last_msg={age}ms{extra}")
+        else:
+            extra = f" | mode={ws_mode}" + (f" ({ws_reason})" if ws_reason else "")
+            self.lbl_live.setText(f"Live: {'WS OK' if self.ws_connected else 'WS NO'}{extra}")
 
         self.lbl_pf.setText("Предпроверка: " + ("OK ✅" if self.preflight_ok else "НЕ ПРОЙДЕНА ❌"))
         self.tbl_pf.set_rows([[r.get("name"), "OK" if r.get("ok") else "FAIL", r.get("details","")] for r in (self.preflight_report or [])])

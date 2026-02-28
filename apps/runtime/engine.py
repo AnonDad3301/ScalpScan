@@ -240,7 +240,13 @@ class Engine:
     def universe(self) -> List[str]:
         u=self.cfg["universe"]; rt=self.cfg["runtime"]
         limit=int(rt.get("max_pairs",50))
-        custom = list(u.get("custom_symbols", []) or [])
+        custom_cfg = u.get("custom_symbols", [])
+        if isinstance(custom_cfg, str):
+            custom = [custom_cfg]
+        elif isinstance(custom_cfg, (list, tuple, set)):
+            custom = [str(x) for x in custom_cfg if str(x)]
+        else:
+            custom = []
 
         def _dedup_fill(primary: List[str], fallback: List[str], cap: int) -> List[str]:
             out: List[str] = []
