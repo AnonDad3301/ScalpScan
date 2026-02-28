@@ -150,9 +150,20 @@ class Engine:
                 "dir_60m": "NEUTRAL",
                 "score_15m": 0.0,
                 "score_60m": 0.0,
+                "conf_15m": 0.0,
+                "conf_60m": 0.0,
                 "bias": 0.0,
             }
         tf_min = self._timeframe_minutes(timeframe)
+
+        def _ema(series: np.ndarray, span: int) -> np.ndarray:
+            span = max(2, int(span))
+            alpha = 2.0 / (span + 1.0)
+            out = np.zeros_like(series, dtype=float)
+            out[0] = float(series[0])
+            for i in range(1, len(series)):
+                out[i] = alpha * float(series[i]) + (1.0 - alpha) * out[i - 1]
+            return out
 
         def _score(window_min: int) -> float:
             bars = max(3, int(round(window_min / max(1, tf_min))))
@@ -164,26 +175,50 @@ class Engine:
                 return 0.0
             ret = float((seg[-1] - seg[0]) / max(1e-12, seg[0]))
             noise = float(np.std(np.diff(seg) / np.maximum(1e-12, seg[:-1])))
-            return ret / max(1e-6, noise)
+            ret_z = ret / max(1e-6, noise)
+
+            fast = max(3, bars // 4)
+            slow = max(fast + 1, bars // 2)
+            ema_fast = _ema(seg, fast)
+            ema_slow = _ema(seg, slow)
+            ema_bias = float((ema_fast[-1] - ema_slow[-1]) / max(1e-12, seg[-1]))
+
+            x = np.arange(seg.size, dtype=float)
+            try:
+                slope = float(np.polyfit(x, seg, 1)[0]) / max(1e-12, float(np.mean(seg)))
+            except Exception:
+                slope = 0.0
+
+            score = (
+                0.45 * np.tanh(0.40 * ret_z)
+                + 0.35 * np.tanh(120.0 * ema_bias)
+                + 0.20 * np.tanh(400.0 * slope)
+            )
+            return float(max(-1.0, min(1.0, score)))
 
         s15 = _score(15)
         s60 = _score(60)
 
         def _dir(v: float) -> str:
-            if v > 0.35:
+            if v > 0.12:
                 return "LONG"
-            if v < -0.35:
+            if v < -0.12:
                 return "SHORT"
             return "NEUTRAL"
 
         d15 = _dir(s15)
         d60 = _dir(s60)
-        bias = 0.35 * np.tanh(0.6 * s15) + 0.65 * np.tanh(0.35 * s60)
+        c15 = abs(float(s15))
+        c60 = abs(float(s60))
+        align = 1.0 if np.sign(s15) == np.sign(s60) else 0.65
+        bias = align * (0.35 * np.tanh(1.0 * s15) + 0.65 * np.tanh(0.85 * s60))
         return {
             "dir_15m": d15,
             "dir_60m": d60,
             "score_15m": float(s15),
             "score_60m": float(s60),
+            "conf_15m": float(c15),
+            "conf_60m": float(c60),
             "bias": float(max(-1.0, min(1.0, bias))),
         }
 
@@ -372,6 +407,8 @@ class Engine:
                 feats["trend_dir_60m"] = mtf_ctx.get("dir_60m", "NEUTRAL")
                 feats["trend_score_15m"] = float(mtf_ctx.get("score_15m", 0.0))
                 feats["trend_score_60m"] = float(mtf_ctx.get("score_60m", 0.0))
+                feats["trend_conf_15m"] = float(mtf_ctx.get("conf_15m", 0.0))
+                feats["trend_conf_60m"] = float(mtf_ctx.get("conf_60m", 0.0))
                 feats["trend_mtf_bias"] = float(mtf_ctx.get("bias", 0.0))
                 st_live = self.portfolio.stats()
                 win_rate = float(st_live.get("win_rate", 0.5))
@@ -538,14 +575,16 @@ class Engine:
                 # Multi-timeframe trend alignment (15m/60m) correction
                 p_raw = float(ens_d.get("p_up_3m", 0.5))
                 mtf_bias = float(feats.get("trend_mtf_bias", 0.0))
-                p_adj = max(0.0, min(1.0, p_raw + 0.15 * mtf_bias))
+                mtf_conf = max(float(feats.get("trend_conf_15m", 0.0)), float(feats.get("trend_conf_60m", 0.0)))
+                mtf_weight = min(0.12, 0.03 + 0.09 * max(0.0, min(1.0, mtf_conf)))
+                p_adj = max(0.0, min(1.0, p_raw + mtf_weight * mtf_bias))
                 ens_d["p_up_3m"] = p_adj
-                ens_d["p_up_5m"] = max(0.0, min(1.0, float(ens_d.get("p_up_5m", 0.5)) + 0.10 * mtf_bias))
+                ens_d["p_up_5m"] = max(0.0, min(1.0, float(ens_d.get("p_up_5m", 0.5)) + 0.75 * mtf_weight * mtf_bias))
                 ens_d["signal_strength"] = abs(p_adj - 0.5) * 2.0
                 ens_d["confidence"] = max(p_adj, 1.0 - p_adj)
                 d60 = str(feats.get("trend_dir_60m", "NEUTRAL"))
                 dir_from_prob = "LONG" if p_adj >= 0.5 else "SHORT"
-                if d60 in ("LONG", "SHORT") and d60 != dir_from_prob and abs(float(feats.get("trend_score_60m", 0.0))) > 0.6:
+                if d60 in ("LONG", "SHORT") and d60 != dir_from_prob and abs(float(feats.get("trend_score_60m", 0.0))) > 0.9:
                     ens_d["no_trade_reason"] = ens_d.get("no_trade_reason") or "mtf_conflict"
                 ens_d["w_a"] = float(ensemble_cfg.get("w_a", 0.55))
                 ens_d["w_b"] = float(ensemble_cfg.get("w_b", 0.45))

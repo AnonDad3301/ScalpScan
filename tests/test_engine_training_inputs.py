@@ -28,6 +28,16 @@ class EngineTrainingInputsTests(unittest.TestCase):
         self.assertEqual(ctx["dir_60m"], "SHORT")
         self.assertLess(ctx["bias"], 0.0)
 
+    def test_mtf_trend_context_has_confidence_fields(self):
+        eng = Engine.__new__(Engine)
+        import numpy as np
+        close = np.linspace(100.0, 112.0, 120)
+        ctx = eng._mtf_trend_context(close, "1m")
+        self.assertIn("conf_15m", ctx)
+        self.assertIn("conf_60m", ctx)
+        self.assertGreaterEqual(float(ctx["conf_60m"]), 0.0)
+        self.assertEqual(ctx["dir_60m"], "LONG")
+
 
 if __name__ == "__main__":
     unittest.main()
