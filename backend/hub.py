@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, json, time, logging, datetime, faulthandler, uuid, os
+import asyncio, json, time, logging, datetime, faulthandler, uuid, os, traceback
 import urllib.parse, urllib.request
 from typing import Any, Dict, Set
 
@@ -119,7 +119,7 @@ class CommandQueue:
                     top = symdb.top_symbols(exchange, mkt, limit, quote=uni.get("quote"), min_volume=float(uni.get("min_volume", 0)))
                     await broadcast({"type": "symbols", "ts": now_ms(), "exchange": exchange, "market": mkt, "count": len(top), "symbols": top})
             except Exception as e:
-                await broadcast({"type": "status", "ts": now_ms(), "status": f"cmd_error:{cmd}:{e}"})
+                await broadcast({"type": "status", "ts": now_ms(), "status": f"cmd_error:{cmd}:{e}", "tb": traceback.format_exc()})
 
 
 COMMANDS = CommandQueue()
@@ -397,7 +397,7 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
                     append_event(es, rt, "TICK_TIMEOUT", {"timeout_sec": tick_timeout}, run_id="tick", level="ERROR")
                 except Exception as e:
                     liveness["tick"] = time.monotonic()
-                    append_event(es, rt, "TICK_ERROR", {"err": str(e)}, run_id="tick", level="ERROR")
+                    append_event(es, rt, "TICK_ERROR", {"err": str(e), "tb": traceback.format_exc()}, run_id="tick", level="ERROR")
             await asyncio.sleep(max(0.05, tick_int))
 
     async def price_loop():
@@ -545,7 +545,7 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
                 append_event(es, rt, "PRICE_TIMEOUT", {"timeout_sec": price_timeout, "open_positions": len(open_syms), "tracked_symbols": len(syms)}, run_id="price", level="ERROR")
             except Exception as e:
                 status = "ERROR"
-                append_event(es, rt, "PRICE_ERROR", {"err": str(e)}, run_id="price", level="ERROR")
+                append_event(es, rt, "PRICE_ERROR", {"err": str(e), "tb": traceback.format_exc()}, run_id="price", level="ERROR")
 
             dt_ms = int((time.time()-t0)*1000)
             liveness["price"] = time.monotonic()
@@ -669,7 +669,7 @@ async def loops(cfg: Dict[str, Any], eng: Engine, es: SQLiteEventStore, market, 
                                 append_event(es, rt, "CMD", {"cmd": c, **r}, run_id="cmd", level="INFO" if r.get("ok") else "ERROR")
                         last_pos=f.tell()
             except Exception as e:
-                append_event(es, rt, "CMD_ERROR", {"err": str(e)}, run_id="cmd", level="ERROR")
+                append_event(es, rt, "CMD_ERROR", {"err": str(e), "tb": traceback.format_exc()}, run_id="cmd", level="ERROR")
             await asyncio.sleep(1.0)
 
 

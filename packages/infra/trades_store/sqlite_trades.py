@@ -56,7 +56,14 @@ class TradesStore:
             json.dumps(t, ensure_ascii=False),
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO trades VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            """
+            INSERT OR REPLACE INTO trades(
+                trade_id, symbol, side, market_type, price_source,
+                bar_ts, decision_ts, entry_ts, exit_ts,
+                entry, exit, qty, fees, pnl, r_mult,
+                reason_exit, payload_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
             row
         )
         self.conn.commit()

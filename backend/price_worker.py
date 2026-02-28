@@ -135,26 +135,25 @@ class PriceWorker:
         self.restart()
         return {}, {"status":"TIMEOUT"}
 
-
-def fetch_mark_prices(self, symbols: List[str], timeout_sec: float) -> Tuple[Dict[str, float], Dict[str, Any]]:
-    self.start()
-    try:
-        self.req_q.put({"cmd":"fetch_mark_prices","symbols":symbols})
-    except Exception as e:
-        return {}, {"status":"ERROR","err":repr(e)}
-    deadline = time.time() + timeout_sec
-    while time.time() < deadline:
+    def fetch_mark_prices(self, symbols: List[str], timeout_sec: float) -> Tuple[Dict[str, float], Dict[str, Any]]:
+        self.start()
         try:
-            msg = self.resp_q.get(timeout=0.05)
-        except Exception:
-            continue
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("type") == "mark_prices":
-            return (msg.get("prices") or {}), {"status":"OK","ts":msg.get("ts")}
-        if msg.get("type") == "fatal":
-            return {}, {"status":"FATAL","err":msg.get("err"),"tb":msg.get("tb")}
-        if msg.get("type") == "error":
-            return {}, {"status":"ERROR","err":msg.get("err"),"tb":msg.get("tb")}
-    self.restart()
-    return {}, {"status":"TIMEOUT"}
+            self.req_q.put({"cmd":"fetch_mark_prices","symbols":symbols})
+        except Exception as e:
+            return {}, {"status":"ERROR","err":repr(e)}
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            try:
+                msg = self.resp_q.get(timeout=0.05)
+            except Exception:
+                continue
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("type") == "mark_prices":
+                return (msg.get("prices") or {}), {"status":"OK","ts":msg.get("ts")}
+            if msg.get("type") == "fatal":
+                return {}, {"status":"FATAL","err":msg.get("err"),"tb":msg.get("tb")}
+            if msg.get("type") == "error":
+                return {}, {"status":"ERROR","err":msg.get("err"),"tb":msg.get("tb")}
+        self.restart()
+        return {}, {"status":"TIMEOUT"}

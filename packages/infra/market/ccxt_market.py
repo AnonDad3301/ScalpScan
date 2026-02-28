@@ -20,7 +20,10 @@ class CCXTMarket:
             raise ValueError(f"Unknown exchange: {exchange_id}")
         self.exchange_id = exchange_id
         self.market = market
-        self.ex = getattr(ccxt, exchange_id)({"enableRateLimit": True, 'timeout': 10000})
+        self._ccxt = ccxt
+        self._params = {"enableRateLimit": True, "timeout": 10000}
+        self._err_count = 0
+        self.ex = getattr(ccxt, exchange_id)(self._params)
 
     def fetch_symbols(self) -> List[Dict[str, Any]]:
         markets = self.ex.load_markets()
@@ -112,18 +115,17 @@ class CCXTMarket:
             return 0.0
         return float(data[-1][4])
 
-
-def fetch_mark_price(self, symbol: str) -> float:
-    """Fetch mark/last price fallback via ticker."""
-    t = self.ex.fetch_ticker(symbol)
-    # bybit returns info; try common fields
-    for k in ("mark", "markPrice", "last", "close"):
-        v = t.get(k) if isinstance(t, dict) else None
-        if v is not None:
-            try:
-                return float(v)
-            except Exception:
-                pass
-    # ccxt standard
-    v = t.get("last") if isinstance(t, dict) else None
-    return float(v) if v is not None else 0.0
+    def fetch_mark_price(self, symbol: str) -> float:
+        """Fetch mark/last price fallback via ticker."""
+        t = self.ex.fetch_ticker(symbol)
+        # bybit returns info; try common fields
+        for k in ("mark", "markPrice", "last", "close"):
+            v = t.get(k) if isinstance(t, dict) else None
+            if v is not None:
+                try:
+                    return float(v)
+                except Exception:
+                    pass
+        # ccxt standard
+        v = t.get("last") if isinstance(t, dict) else None
+        return float(v) if v is not None else 0.0
